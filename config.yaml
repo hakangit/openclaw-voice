@@ -1,0 +1,45 @@
+# OpenClaw Voice Configuration
+# SIP ↔ xAI Grok Voice Agent Bridge (OpenClaw Plugin)
+
+xai:
+  api_key: ${XAI_API_KEY}
+  voice: "Rex"  # Options: Rex, Ara, Sal, Eve, Leo
+  instructions: |
+    You are a helpful voice assistant.
+    Keep responses brief and conversational - you're talking on a phone.
+
+sip:
+  server: "free1.voipgateway.org"
+  port: 5060
+  extension: "your_extension"
+  password: ${SIP_PASSWORD}
+  display_name: "OpenClaw"
+  rtp_port: 40000
+
+# Audio settings
+# NOTE: No conversion needed! xAI supports 8kHz u-law natively.
+audio:
+  format: "pcmu"  # G.711 u-law
+  sample_rate: 8000
+  frame_ms: 20
+
+# Daemon settings
+daemon:
+  api_port: 8079
+  max_concurrent_calls: 3
+
+# OpenClaw Gateway integration
+openclaw:
+  gateway_port: 18789
+  gateway_token: ${OPENCLAW_GATEWAY_TOKEN}
+  session_key: "openclaw-voice"
+
+# Authentication
+auth:
+  pin: ${OPENCLAW_AUTH_PIN}
+  whitelist: []  # caller numbers that skip PIN (e.g. ["+15551234567"])
+
+# Logging
+logging:
+  level: "INFO"
+  record_calls: false

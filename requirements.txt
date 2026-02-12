@@ -1,0 +1,28 @@
+# Voice Bridge Dependencies
+# Install: pip install -r requirements.txt
+
+# WebSocket client for xAI Voice Agent
+websockets>=12.0
+
+# HTTP client for API calls (tank status, weather, etc.)
+aiohttp>=3.9.0
+
+# NumPy for audio buffer manipulation (optional, for VAD)
+numpy>=1.24.0
+
+# Voice Activity Detection (WebRTC VAD)
+# Detects speech vs silence for speakerphone support
+webrtcvad>=2.0.10
+
+# Config file parsing
+pyyaml>=6.0
+
+# Environment variable loading
+python-dotenv>=1.0.0
+
+# Async file I/O for query/response communication
+aiofiles>=23.0.0
+
+# NOTE: samplerate library REMOVED - no longer needed!
+# xAI Grok Voice API natively supports 8kHz u-law (G.711)
+# which is the exact format SIP phones use.

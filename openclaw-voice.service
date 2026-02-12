@@ -1,0 +1,23 @@
+[Unit]
+Description=OpenClaw Voice (SIP + xAI Voice Agent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/openclaw_voice
+ExecStart=/opt/openclaw_voice/venv/bin/python openclaw_voice.py
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=10
+EnvironmentFile=/opt/openclaw_voice/.env
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openclaw-voice
+
+[Install]
+WantedBy=multi-user.target
