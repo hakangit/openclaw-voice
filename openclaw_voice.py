@@ -342,6 +342,9 @@ class CallSession:
     hangup_scheduled: bool = False
     # Conference: when set, outbound RTP audio is also forwarded to this session
     conference_peer: Optional['CallSession'] = None
+    # Set when the call has been torn down at the SIP level, so a late
+    # watchdog tick does not send a second BYE.
+    bye_sent: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -627,8 +630,47 @@ class OpenClawVoice:
         persona = (self.config.get('xai') or {}).get('instructions') or ''
         persona = persona.strip()
         if not persona:
-            return base
-        return f"{persona}\n\n{base}"
+            base = base
+        else:
+            base = f"{persona}\n\n{base}"
+
+        callback = self._callback_block()
+        if callback:
+            base = f"{base}\n\n{callback}"
+        return base
+
+    def _callback_block(self) -> str:
+        """Build the per-customer callback instructions, if configured.
+
+        Without this the agent had no way to tell a caller where to call
+        back -- it said "call Alex back" by name only, because no callback
+        number existed anywhere in the config.
+
+        If `callback.number` is empty we fall back to "the same number you
+        just called", which is always correct for a receptionist: the DID
+        the caller dialled is by definition the number they can call back on.
+        """
+        cb = self.config.get('callback') or {}
+        number = str(cb.get('number') or '').strip()
+        name = str(cb.get('name') or '').strip()
+
+        if number:
+            who = f"{name} at {number}" if name else number
+            return (
+                f"CALLBACK DETAILS: if the caller asks you to call them back, or if "
+                f"you leave a message, tell them to call {who}. Read the number "
+                f"exactly as written: {number}. Never guess or invent a number."
+            )
+
+        if cb:
+            # callback block present but no number: use the safe fallback.
+            who = name or "us"
+            return (
+                f"CALLBACK DETAILS: if the caller asks you to call them back, or if "
+                f"you leave a message, tell them to call {who} back on the same "
+                f"number they just called. Do not invent or guess any phone number."
+            )
+        return ""
 
     # ---- Outbound call handling ------------------------------------------
 
@@ -837,6 +879,25 @@ class OpenClawVoice:
             asyncio.create_task(sip_to_xai()),
             asyncio.create_task(xai_to_sip()),
         ]
+
+        # --- Max call duration guard -------------------------------------
+        #
+        # A stuck call (bad teardown, peer that never sends BYE) would hold a
+        # concurrency slot and burn xAI tokens forever. There was no ceiling
+        # at all before this.
+        max_duration = self._max_call_duration()
+        duration_task = None
+        if max_duration:
+            async def _duration_guard():
+                await asyncio.sleep(max_duration)
+                if running and session.state != 'ended':
+                    logger.warning(
+                        f"Call {session.call_id[:16]} hit the {max_duration}s "
+                        f"maximum duration; forcing teardown"
+                    )
+                    await self._end_call(session)
+            duration_task = asyncio.create_task(_duration_guard())
+
         try:
             done, pending = await asyncio.wait(loops, return_when=asyncio.FIRST_COMPLETED)
             for t in pending:
@@ -845,7 +906,18 @@ class OpenClawVoice:
         except asyncio.CancelledError:
             pass
         finally:
+            if duration_task and not duration_task.done():
+                duration_task.cancel()
             await self._end_call(session)
+
+    def _max_call_duration(self) -> int:
+        """Maximum call duration in seconds (0 = unlimited)."""
+        raw = (self.config.get('daemon') or {}).get('max_call_duration_s', 0)
+        try:
+            value = int(raw or 0)
+        except (TypeError, ValueError):
+            return 0
+        return value if value > 0 else 0
 
     async def _end_call(self, session: CallSession):
         """Clean up a call session."""
@@ -872,15 +944,51 @@ class OpenClawVoice:
         # Send SIP BYE
         if self.sip_client and session.call_id in self.sip_client._active_calls:
             try:
-                await self.sip_client.hangup(call_id=session.call_id)
+                ok = await self.sip_client.hangup(call_id=session.call_id)
+                session.bye_sent = bool(ok)
+                if not ok:
+                    logger.warning(
+                        f"BYE for {session.call_id[:16]} was not acknowledged; "
+                        f"attempting fallback teardown"
+                    )
+                    await self._force_teardown(session)
             except Exception as e:
                 logger.warning(f"Hangup error: {e}")
+                await self._force_teardown(session)
 
         # Cancel background task
         if session.task and not session.task.done():
             session.task.cancel()
 
         self.call_manager.remove(session.call_id)
+
+    async def _force_teardown(self, session: CallSession):
+        """Last-resort teardown when the normal BYE was not acknowledged.
+
+        If the peer rejects our BYE (e.g. 481) the SIP dialog may still be
+        alive on the PBX even though our side considers the call over. The
+        PBX has its own RTP timeout, so the call does eventually drop — but
+        the caller waits in silence for that long. This sends a bare RTP
+        teardown (RFC 3550 BYE packet) which the media stack treats as an
+        abrupt end, and then confirms the dialog state.
+        """
+        logger.warning(f"Forcing teardown for call {session.call_id[:16]}")
+        rtp = session.rtp_session
+        if rtp:
+            try:
+                close = getattr(rtp, 'close', None)
+                if close:
+                    close()
+            except Exception as e:
+                logger.warning(f"RTP force-close error: {e}")
+
+        # If the SIP dialog is still registered locally, drop it so the
+        # daemon stops tracking a call that no longer exists.
+        if self.sip_client:
+            try:
+                self.sip_client._active_calls.pop(session.call_id, None)
+            except Exception:
+                pass
 
     # ---- Tool execution --------------------------------------------------
 

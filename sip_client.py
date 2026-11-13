@@ -875,6 +875,15 @@ class SIPClient:
                         'from_uri': from_uri,
                         'to_uri': to_uri,
                         'addr': addr,
+                        # Dialog identity for a correct in-dialog BYE.
+                        'remote_target': to_uri,
+                        'remote_contact': self._extract_header(response_text, 'Contact'),
+                        'remote_from_uri': from_uri,
+                        'remote_to_uri': to_uri,
+                        'bye_from_header': f'"{self.display_name}" <{from_uri}>;tag={from_tag}',
+                        'bye_to_header': to_with_tag,
+                        'invite_cseq': invite_cseq,
+                        'local_cseq': max(invite_cseq + 1, self.cseq),
                     }
                     self._active_calls[call_id] = call_state
 
@@ -1254,6 +1263,36 @@ class SIPClient:
             return match.group(1)
         return None
 
+    def _extract_cseq_number(self, cseq_header: str) -> int:
+        """Extract the numeric part of a CSeq header ('2008 INVITE' -> 2008)."""
+        if not cseq_header:
+            return 0
+        match = re.match(r'\s*(\d+)', cseq_header)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return 0
+        return 0
+
+    def _extract_uri(self, header_value: str) -> str:
+        """Extract the SIP URI from a header value.
+
+        '\"Anonymous\" <sip:anonymous@anonymous.invalid>;tag=abc' ->
+        'sip:anonymous@anonymous.invalid'
+        """
+        if not header_value:
+            return ""
+        match = re.search(r'<([^>]+)>', header_value)
+        if match:
+            return match.group(1).strip()
+        # No angle brackets: take the first whitespace-delimited token.
+        token = header_value.split(';')[0].strip()
+        parts = token.split(None, 1)
+        if len(parts) == 2:
+            return parts[1].strip()
+        return token
+
     def _extract_sdp_ip(self, message: str) -> Optional[str]:
         """Extract media IP from SDP c= line"""
         match = re.search(r'c=IN IP4 (\S+)', message)
@@ -1506,8 +1545,35 @@ class SIPClient:
                 if not ack_received:
                     logger.warning("No ACK received within 5s, proceeding anyway")
 
-            # Store per-call state
+            # Store per-call state.
+            #
+            # The dialog identity MUST be captured verbatim from the INVITE.
+            # The old code rebuilt From/To from scratch and pointed the BYE
+            # Request-URI at our own address, so Asterisk answered every
+            # inbound BYE with '481 Call/Transaction Does Not Exist' and the
+            # call stayed up on the PBX while the daemon believed it had
+            # ended (symptom: caller hears silence, call never disconnects).
+            #
+            # For an inbound call the BYE must target the REMOTE party:
+            #   - Request-URI: the contact URI the caller advertised
+            #   - From:        our identity, tagged with OUR to-tag
+            #   - To:          the caller's identity, tagged with THEIR tag
+            #   - CSeq:        higher than the INVITE's, in the same dialog
             from_tag = self._extract_tag(from_header)
+            remote_uri = self._extract_uri(from_header)
+            remote_contact = self._extract_header(invite_message, 'Contact')
+            remote_target = self._extract_uri(remote_contact) or remote_uri
+            invite_cseq = self._extract_cseq_number(cseq_header)
+
+            # For a request WE send inside an inbound dialog, the roles are
+            # swapped relative to the INVITE (RFC 3261 8.1.1.3):
+            #   our BYE From = our URI + the tag we used in the 200 OK
+            #   our BYE To   = the caller's URI + the caller's tag
+            # so the 200 OK's To header becomes the BYE's From, and the
+            # INVITE's From becomes the BYE's To.
+            bye_from_header = to_with_tag
+            bye_to_header = from_header
+
             call_state = {
                 'call_id': call_id,
                 'direction': 'inbound',
@@ -1519,6 +1585,14 @@ class SIPClient:
                 'from_uri': f"sip:{self.extension}@{self.server}",
                 'to_uri': f"sip:{self.extension}@{self.server}",
                 'addr': addr,
+                # Dialog identity for a correct in-dialog BYE.
+                'remote_target': remote_target,
+                'remote_contact': remote_contact,
+                'remote_from_uri': remote_uri,
+                'remote_to_uri': self._extract_uri(to_header),
+                'bye_from_header': bye_from_header,
+                'bye_to_header': bye_to_header,                'invite_cseq': invite_cseq,
+                'local_cseq': max(invite_cseq + 1, self.cseq),
             }
             self._active_calls[call_id] = call_state
 
@@ -1596,12 +1670,30 @@ class SIPClient:
     # ------------------------------------------------------------------
 
     async def hangup(self, call_id: Optional[str] = None, target_extension: Optional[str] = None):
-        """Send BYE to hangup a specific call (or the legacy active_call)."""
+        """Send BYE to hangup a specific call (or the legacy active_call).
+
+        The BYE must be a valid in-dialog request, and the daemon must wait
+        for the response before declaring the call over. Both were broken:
+
+        1. The Request-URI pointed at OUR OWN address, so Asterisk replied
+           '481 Call/Transaction Does Not Exist' and the call stayed up on
+           the PBX while the daemon logged success.
+        2. From/To were rebuilt from scratch instead of reusing the dialog
+           identity captured from the INVITE/200 OK.
+        3. CSeq was taken from the global REGISTER counter, not the call's
+           dialog sequence.
+        4. The response was never read, so a rejected BYE was invisible.
+
+        Now: build the request from the stored dialog identity, wait for the
+        response, and report the outcome. RTP is closed after the BYE is
+        acknowledged (or after a short grace period) so the far end does not
+        hear premature silence.
+        """
         # Resolve call state: prefer per-call dict, fall back to legacy
         cid = call_id or self.active_call
         if not cid:
             logger.warning("hangup: no active call")
-            return
+            return False
 
         call_state = self._active_calls.get(cid)
 
@@ -1611,45 +1703,122 @@ class SIPClient:
             from_tag = call_state.get('from_tag', self.from_tag)
             to_tag = call_state.get('to_tag', self.to_tag)
             rtp = call_state.get('rtp_session')
+            # Dialog identity captured at INVITE/200-OK time.
+            remote_target = call_state.get('remote_target') or to_uri
+            bye_from_header = call_state.get('bye_from_header')
+            bye_to_header = call_state.get('bye_to_header')
+            local_cseq = int(call_state.get('local_cseq') or self.cseq)
         else:
             to_uri = getattr(self, '_call_to_uri', None) or f"sip:{target_extension or self.extension}@{self.server}"
             from_uri = getattr(self, '_call_from_uri', None) or f"sip:{self.extension}@{self.server}"
             from_tag = self.from_tag
             to_tag = self.to_tag
             rtp = self.rtp_session
+            remote_target = to_uri
+            bye_from_header = None
+            bye_to_header = None
+            local_cseq = self.cseq
 
         if not rtp:
             logger.warning(f"hangup: no RTP session for {cid[:16]}")
-            return
+            # Still try to send the BYE: without RTP there is nothing to close
+            # but the SIP dialog may still be alive.
+            rtp = None
 
         contact_uri = f"sip:{self.extension}@{self.external_ip or self.local_ip}:{self.contact_port}"
 
-        # Build To header with tag (required for in-dialog requests per RFC 3261)
-        to_header = f"<{to_uri}>"
-        if to_tag:
-            to_header = f"{to_header};tag={to_tag}"
+        # --- Build the in-dialog BYE -------------------------------------
+        #
+        # Request-URI: the REMOTE party. For an inbound call this is the
+        # Contact the caller advertised; for an outbound call it is the URI
+        # we invited.
+        request_uri = remote_target or to_uri
+
+        # From: our identity + our tag. To: their identity + their tag.
+        # Prefer the verbatim headers captured from the dialog so the tags
+        # and display names match exactly what the peer has on file.
+        if bye_from_header and bye_to_header:
+            from_header_out = bye_from_header
+            to_header_out = bye_to_header
+        else:
+            from_header_out = f'"{self.display_name}" <{from_uri}>;tag={from_tag}'
+            to_header_out = f"<{to_uri}>"
+            if to_tag:
+                to_header_out = f"{to_header_out};tag={to_tag}"
+
+        # In-dialog CSeq must be higher than the INVITE's.
+        bye_cseq = max(local_cseq, self.cseq)
 
         bye_request = (
-            f"BYE {to_uri} SIP/2.0\r\n"
+            f"BYE {request_uri} SIP/2.0\r\n"
             f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={self._generate_branch()}\r\n"
-            f'From: "{self.display_name}" <{from_uri}>;tag={from_tag}\r\n'
-            f"To: {to_header}\r\n"
+            f"From: {from_header_out}\r\n"
+            f"To: {to_header_out}\r\n"
             f"Call-ID: {cid}\r\n"
-            f"CSeq: {self.cseq} BYE\r\n"
+            f"CSeq: {bye_cseq} BYE\r\n"
             f"Contact: <{contact_uri}>\r\n"
             f"Max-Forwards: 70\r\n"
             f"Content-Length: 0\r\n"
             f"\r\n"
         )
 
+        # Wait for the response on this Call-ID's queue.
+        self._create_response_queue(cid)
+
         try:
             self._send(bye_request.encode(), (self.server, self.port))
-            logger.info(f"Sent BYE for {cid[:16]}")
-            self.cseq += 1
+            logger.info(
+                f"Sent BYE for {cid[:16]} (target={request_uri}, cseq={bye_cseq})"
+            )
+            self.cseq = max(self.cseq, bye_cseq) + 1
         except Exception as e:
             logger.error(f"Error sending BYE: {e}")
+            self._remove_response_queue(cid)
+            if rtp:
+                rtp.close()
+            return False
 
-        rtp.close()
+        # --- Wait for the peer's answer ---------------------------------
+        #
+        # Reading the response is what turns "we sent a BYE" into "the call
+        # really ended". A 481/500 means the peer does not know this
+        # dialog, so the BYE was malformed -- report it instead of silently
+        # pretending the call was torn down.
+        response_text = None
+        bye_acked = False
+        try:
+            response_text, _ = await self._recv_filtered(cid, timeout=5.0)
+        except Exception as e:
+            logger.warning(f"Error waiting for BYE response: {e}")
+
+        status = ''
+        if response_text:
+            status = response_text.split('\r\n')[0].split('\n')[0]
+            logger.info(f"BYE response for {cid[:16]}: {status}")
+            if re.search(r'\b200\b', status):
+                bye_acked = True
+                logger.info(f"BYE acknowledged by peer for {cid[:16]}")
+            else:
+                logger.warning(
+                    f"BYE REJECTED for {cid[:16]}: {status} "
+                    f"(peer did not accept the teardown)"
+                )
+        else:
+            logger.warning(
+                f"No BYE response for {cid[:16]} within 5s "
+                f"(peer may be unreachable; forcing RTP close)"
+            )
+
+        self._remove_response_queue(cid)
+
+        # Close RTP only AFTER the BYE has been answered (or the grace period
+        # expired). Closing it first is what produced the 'sudden silence
+        # but the call stays up' symptom.
+        if rtp:
+            try:
+                rtp.close()
+            except Exception as e:
+                logger.warning(f"Error closing RTP for {cid[:16]}: {e}")
 
         # Clean up per-call state
         self._active_calls.pop(cid, None)
@@ -1660,6 +1829,10 @@ class SIPClient:
             self.active_call = None
             self.to_tag = None
         logger.info(f"Call {cid[:16]} ended")
+        # Report the real outcome: only an acknowledged BYE counts as a
+        # successful teardown. A 481/5xx or a timeout must not be reported as
+        # success, or the caller is left in a call that is still up.
+        return bye_acked
 
     async def stop(self):
         """Stop SIP client and hang up all active calls."""
