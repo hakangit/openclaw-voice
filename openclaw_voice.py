@@ -116,6 +116,23 @@ def load_config() -> dict:
             config_str = config_str.replace(placeholder, os.getenv(key, placeholder))
     config = yaml.safe_load(config_str)
     config['_config_path'] = str(config_path)
+
+    # Per-instance OpenClaw session key. Every customer instance shares the
+    # same OpenClaw gateway, so a shared session key would put every
+    # customer's process_query conversations into ONE OpenClaw session --
+    # leaking context (and potentially private data) between customers.
+    # Derive an instance-scoped key unless the configured one already
+    # references the instance.
+    instance_id = os.getenv('OPENCLAW_VOICE_INSTANCE', '').strip()
+    if instance_id:
+        openclaw_cfg = config.setdefault('openclaw', {})
+        configured_key = str(openclaw_cfg.get('session_key') or '').strip()
+        if instance_id not in configured_key:
+            openclaw_cfg['session_key'] = f"openclaw-voice-{instance_id}"
+            logger.info(
+                f"Scoped OpenClaw session key for instance '{instance_id}'"
+            )
+
     return config
 
 
