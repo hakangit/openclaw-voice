@@ -258,6 +258,12 @@ TOOLS_AUTHENTICATED = [
     },
 ]
 
+# hangup_call is exposed even to unauthenticated callers: ending a call
+# must always be possible.
+TOOL_HANGUP = next(
+    tool for tool in TOOLS_AUTHENTICATED if tool["name"] == "hangup_call"
+)
+
 # Tools available on outbound calls. Outbound calls are dialled by us via the
 # control API, so the caller has already been authorised by whoever placed
 # the call. The agent needs hangup_call so it can end the call itself.
@@ -664,11 +670,14 @@ class OpenClawVoice:
 
         if cb:
             # callback block present but no number: use the safe fallback.
-            who = name or "us"
+            # We must not invent a number. The receptionist behaviour that is
+            # always correct is to ask the caller for their callback number
+            # and read it back to confirm it.
             return (
-                f"CALLBACK DETAILS: if the caller asks you to call them back, or if "
-                f"you leave a message, tell them to call {who} back on the same "
-                f"number they just called. Do not invent or guess any phone number."
+                f"CALLBACK DETAILS: if the caller asks you to call them back, or "
+                f"if they want to leave a message, ask them for a callback number "
+                f"and read it back exactly as they said it to confirm. Do not "
+                f"guess, invent, or guess at any phone number."
             )
         return ""
 
@@ -739,7 +748,14 @@ class OpenClawVoice:
         elif session.authenticated:
             tools = TOOLS_AUTHENTICATED
         else:
-            tools = [TOOL_AUTHENTICATE]
+            # The caller has not authenticated, so they only get the
+            # authenticate tool -- EXCEPT hangup_call, which must always be
+            # reachable. An unauthenticated caller who wants to leave must
+            # never be trapped on the line. The handler already treats
+            # hangup_call as never-gated; without exposing the tool here
+            # that promise was unreachable, because the model could not
+            # name a tool it was never given.
+            tools = [TOOL_AUTHENTICATE, TOOL_HANGUP]
 
         bridge = XAIVoiceBridge(
             api_key=self.config['xai']['api_key'],
