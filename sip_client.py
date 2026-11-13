@@ -1591,7 +1591,8 @@ class SIPClient:
                 'remote_from_uri': remote_uri,
                 'remote_to_uri': self._extract_uri(to_header),
                 'bye_from_header': bye_from_header,
-                'bye_to_header': bye_to_header,                'invite_cseq': invite_cseq,
+                'bye_to_header': bye_to_header,
+                'invite_cseq': invite_cseq,
                 'local_cseq': max(invite_cseq + 1, self.cseq),
             }
             self._active_calls[call_id] = call_state
@@ -1727,6 +1728,21 @@ class SIPClient:
 
         contact_uri = f"sip:{self.extension}@{self.external_ip or self.local_ip}:{self.contact_port}"
 
+        # --- Where to send the BYE ---------------------------------------
+        #
+        # The BYE must go to the peer that sent us the INVITE, not to the
+        # server we are registered with. Those are the same address for a
+        # PBX-originated call (which is why this went unnoticed), but for
+        # any other peer -- a softphone, another SBC, a loopback test
+        # agent -- the BYE was being sent to the wrong place and the peer
+        # never saw it. We captured the source address of the INVITE, so
+        # use it, and fall back to the server only when it is unknown.
+        bye_dest = None
+        if call_state:
+            bye_dest = call_state.get('addr')
+        if not bye_dest:
+            bye_dest = (self.server, self.port)
+
         # --- Build the in-dialog BYE -------------------------------------
         #
         # Request-URI: the REMOTE party. For an inbound call this is the
@@ -1766,9 +1782,10 @@ class SIPClient:
         self._create_response_queue(cid)
 
         try:
-            self._send(bye_request.encode(), (self.server, self.port))
+            self._send(bye_request.encode(), bye_dest)
             logger.info(
-                f"Sent BYE for {cid[:16]} (target={request_uri}, cseq={bye_cseq})"
+                f"Sent BYE for {cid[:16]} (target={request_uri}, "
+                f"dest={bye_dest[0]}:{bye_dest[1]}, cseq={bye_cseq})"
             )
             self.cseq = max(self.cseq, bye_cseq) + 1
         except Exception as e:
