@@ -33,6 +33,32 @@ import websockets
 
 logger = logging.getLogger(__name__)
 
+_SECRET_LOG_KEYS = {"pin", "password", "secret", "token", "api_key", "apikey", "key"}
+
+
+def _redact_tool_args(args: Any) -> Any:
+    """Mask credential-bearing tool arguments before logging.
+
+    The `authenticate` tool carries the caller's PIN in its `pin` argument.
+    Logging the raw xAI function-call arguments wrote the PIN to the journal
+    on every successful authentication, bypassing the redaction that
+    `openclaw_voice._redact_tool_args` applies to its own log line.
+    """
+    if isinstance(args, dict):
+        return {
+            key: ("***" if str(key).strip().lower() in _SECRET_LOG_KEYS else value)
+            for key, value in args.items()
+        }
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+        except (ValueError, TypeError):
+            return args
+        if isinstance(parsed, dict):
+            return json.dumps(_redact_tool_args(parsed))
+    return args
+
+
 # Audio constants - xAI uses same format as SIP!
 RTP_FRAME_BYTES = 160  # 160 bytes u-law = 20ms @ 8kHz
 RTP_FRAME_MS = 20
@@ -288,7 +314,7 @@ class XAIVoiceBridge:
             name = msg.get("name", "")
             arguments = msg.get("arguments", "{}")
 
-            logger.info(f"Tool call: {name}({arguments})")
+            logger.info(f"Tool call: {name}({_redact_tool_args(arguments)})")
 
             if self.on_tool_call:
                 try:

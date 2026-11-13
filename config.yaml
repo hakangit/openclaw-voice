@@ -37,7 +37,7 @@ openclaw:
 # Authentication
 auth:
   pin: ${OPENCLAW_AUTH_PIN}
-  whitelist: []  # caller numbers that skip PIN (e.g. ["+15551234567"])
+  whitelist: []  # caller numbers that skip PIN (e.g. ["+1555XXXX567"])
 
 # Logging
 logging:

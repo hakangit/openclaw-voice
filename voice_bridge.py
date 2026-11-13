@@ -54,6 +54,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_SECRET_LOG_KEYS = {"pin", "password", "secret", "token", "api_key", "apikey", "key"}
+
+
+def _redact_tool_args(args):
+    """Mask credential-bearing tool arguments before logging.
+
+    The `authenticate` tool carries the caller's PIN in its `pin` argument, so
+    logging tool args verbatim writes the PIN to the journal. Parse a JSON
+    string before masking, or the mask never applies.
+    """
+    if isinstance(args, dict):
+        return {
+            key: ("***" if str(key).strip().lower() in _SECRET_LOG_KEYS else value)
+            for key, value in args.items()
+        }
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+        except (ValueError, TypeError):
+            return args
+        if isinstance(parsed, dict):
+            return json.dumps(_redact_tool_args(parsed))
+    return args
+
+
 
 # ============================================================================
 # UNIVERSAL TOOL DEFINITION
@@ -178,7 +203,7 @@ async def send_query_to_openclaw(query: str) -> str:
 
 async def execute_tool(call_id: str, name: str, args: dict, bridge: XAIVoiceBridge) -> str:
     """Execute a tool and return the result."""
-    logger.info(f"Tool call: {name}({args})")
+    logger.info(f"Tool call: {name}({_redact_tool_args(args)})")
     
     try:
         if name == "process_query":

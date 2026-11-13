@@ -1,4 +1,8 @@
 .env
+.env.*
+!.env.example
+*.bak
+*.bak.*
 __pycache__/
 .venv/
 *.pyc
