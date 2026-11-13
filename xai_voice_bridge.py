@@ -290,6 +290,13 @@ class XAIVoiceBridge:
                 except Exception as e:
                     logger.error(f"Tool call error: {e}")
                     await self._send_tool_result(call_id, {"error": str(e)})
+            else:
+                # No handler registered (e.g. an outbound call, where the
+                # model has no tools). Tell xAI so it doesn't wait forever.
+                logger.warning(f"Tool call '{name}' received but no handler is registered")
+                await self._send_tool_result(
+                    call_id, {"error": f"No handler for tool '{name}'"}
+                )
 
         elif msg_type == "error":
             error_msg = msg.get("error", {}).get("message", "Unknown error")

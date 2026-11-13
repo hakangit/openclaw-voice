@@ -31,6 +31,7 @@ class RTPSession:
         self.sequence = 0
         self.timestamp = 0
         self.ssrc = hash(uuid.uuid4()) & 0xFFFFFFFF
+        self._closed = False
 
     def set_remote(self, addr: str, port: int):
         """Set remote RTP endpoint"""
@@ -88,6 +89,8 @@ class RTPSession:
 
     def receive_audio(self, timeout: float = 0.1) -> Optional[bytes]:
         """Receive RTP packet and extract audio payload"""
+        if self._closed:
+            raise OSError("RTP session closed")
         self.socket.settimeout(timeout)
         try:
             data, addr = self.socket.recvfrom(2048)
@@ -99,12 +102,21 @@ class RTPSession:
         except socket.timeout:
             return None
         except Exception as e:
+            if self._closed:
+                # Socket was closed underneath us (remote hangup). Surface the
+                # teardown so the call loop can end the call instead of
+                # spinning on a dead descriptor.
+                raise OSError("RTP session closed")
             logger.error(f"RTP receive error: {e}")
             return None
 
     def close(self):
         """Close RTP socket"""
-        self.socket.close()
+        self._closed = True
+        try:
+            self.socket.close()
+        except Exception:
+            pass
 
 
 class SIPProtocol(asyncio.DatagramProtocol):
@@ -571,7 +583,7 @@ class SIPClient:
 
             auth_header = 'Authorization: Digest ' + ', '.join(auth_parts)
 
-            logger.info(f"Authorization header: {auth_header}")
+            logger.info("Authorization header: Digest <redacted>")
 
             # Send authenticated REGISTER (keep same Call-ID and From tag)
             self.cseq += 1
@@ -731,6 +743,13 @@ class SIPClient:
 
             # Generate call parameters
             call_id = self._generate_call_id()
+            # Expose the call_id to the caller BEFORE the call starts. The
+            # handler is only invoked once the call is answered, which can be
+            # many seconds later -- so the caller could not know the call_id
+            # while waiting, and an API caller got "call failed" even though
+            # the call was fine. This lets make_outbound_call return the
+            # call_id immediately.
+            self.last_call_id = call_id
             from_tag = self._generate_tag()
             branch = self._generate_branch()
             invite_cseq = self.cseq
@@ -830,9 +849,12 @@ class SIPClient:
                     # Extract media IP from SDP (c= line)
                     rtp_ip = self._extract_sdp_ip(response_text) or addr[0]
 
-                    # Extract negotiated codec from SDP answer
+                    # In an SDP *answer*, the first payload type in the m= line
+                    # is the one the answerer selected for the session
+                    # (RFC 3264 §6). We must honour that choice, not override
+                    # it with our own preference.
                     negotiated_codec = self._extract_sdp_codec(response_text)
-                    codec_name = "G.722" if negotiated_codec == 9 else "PCMU"
+                    codec_name = {0: "PCMU", 8: "PCMA", 9: "G.722"}.get(negotiated_codec, "PCMU")
                     logger.info(f"Negotiated codec: {codec_name} (payload type {negotiated_codec})")
 
                     # Set remote RTP endpoint
@@ -1007,16 +1029,19 @@ class SIPClient:
                 self.rtp_session = RTPSession()
             rtp_port = self.rtp_session.local_port
 
-        # Offer PCMU (0) first since xAI uses u-law natively, then G.722 as fallback
+        # Offer PCMU (0) ONLY. The xAI realtime bridge speaks G.711 u-law, and
+        # Asterisk picks its own favourite from whatever we offer — offering
+        # G.722 (9) as well made Asterisk answer "m=audio ... RTP/AVP 9 0",
+        # i.e. G.722, which we cannot encode. The caller then heard noise.
+        # Offering only PCMU forces Asterisk to answer with PCMU.
         sdp_lines = [
             "v=0",
             f"o=- {int(time.time())} 1 IN IP4 {sdp_ip}",
             "s=HFIB Voice Call",
             f"c=IN IP4 {sdp_ip}",
             "t=0 0",
-            f"m=audio {rtp_port} RTP/AVP 0 9",
+            f"m=audio {rtp_port} RTP/AVP 0",
             "a=rtpmap:0 PCMU/8000",
-            "a=rtpmap:9 G722/8000",
             "a=sendrecv",
             "a=ptime:20",
             "",
@@ -1192,6 +1217,36 @@ class SIPClient:
             return int(match.group(1))
         return 0  # Default to PCMU
 
+    def _extract_offered_codecs(self, message: str) -> list:
+        """Extract the full list of payload types the peer offered in its SDP.
+
+        `m=audio <port> RTP/AVP <pt> <pt> ...` — the first entry is the peer's
+        preference. We need the whole list because the answer must only offer
+        codecs the peer actually offered.
+        """
+        match = re.search(r'm=audio \d+ [^\r\n]*?(\d+(?:\s+\d+)*)', message)
+        if not match:
+            return []
+        try:
+            return [int(pt) for pt in match.group(1).split()]
+        except ValueError:
+            return []
+
+    def _pick_codec(self, offered_codecs: list) -> int:
+        """Choose the payload type to answer with.
+
+        The xAI realtime bridge only speaks G.711 u-law (PCMU, payload type 0),
+        so we cannot answer with G.722 (PT 9) even though Asterisk prefers it —
+        doing so produces a half-duplex call where the caller hears silence.
+
+        Prefer PCMU (0) whenever the peer offers it. Otherwise fall back to
+        PCMA (8), and only then to the peer's first preference.
+        """
+        for preferred in (0, 8):
+            if preferred in offered_codecs:
+                return preferred
+        return offered_codecs[0] if offered_codecs else 0
+
     def _extract_tag(self, header_value: str) -> Optional[str]:
         """Extract tag parameter from a SIP header value"""
         match = re.search(r'tag=([^\s;>]+)', header_value)
@@ -1365,10 +1420,15 @@ class SIPClient:
             rtp_port = self._extract_sdp_port(invite_message)
             rtp_ip = self._extract_sdp_ip(invite_message) or addr[0]
 
-            # Extract negotiated codec from SDP offer
-            negotiated_codec = self._extract_sdp_codec(invite_message)
-            codec_name = "G.722" if negotiated_codec == 9 else "PCMU"
+            # Extract the codec list the caller offered and pick the one we can
+            # actually use. We only send/receive G.711 u-law with the xAI
+            # bridge, so prefer PCMU over Asterisk's preferred G.722.
+            offered_codecs = self._extract_offered_codecs(invite_message)
+            negotiated_codec = self._pick_codec(offered_codecs)
+            codec_name = {0: "PCMU", 8: "PCMA", 9: "G.722"}.get(negotiated_codec, "PCMU")
             logger.info(f"Incoming call codec: {codec_name} (payload type {negotiated_codec})")
+            if offered_codecs:
+                logger.info(f"Caller offered codecs: {offered_codecs}; answering with {codec_name}")
 
             # Create RTP session (per-call, not instance-level)
             rtp_session = RTPSession()
@@ -1405,7 +1465,7 @@ class SIPClient:
             self._send(ringing_response.encode(), addr)
 
             # Send 200 OK with per-call RTP session
-            ok_response = self._build_200_ok(call_id, from_header, to_with_tag, via_header, cseq_header, rtp_session=rtp_session)
+            ok_response = self._build_200_ok(call_id, from_header, to_with_tag, via_header, cseq_header, rtp_session=rtp_session, payload_type=negotiated_codec)
             self._send(ok_response.encode(), addr)
 
             logger.info(f"Call answered, RTP session established")
@@ -1478,7 +1538,7 @@ class SIPClient:
                 if cs.get('rtp_session'):
                     cs['rtp_session'].close()
 
-    def _build_200_ok(self, call_id: str, from_header: str, to_header: str, via_header: str, cseq_header: str, rtp_session: Optional[RTPSession] = None) -> str:
+    def _build_200_ok(self, call_id: str, from_header: str, to_header: str, via_header: str, cseq_header: str, rtp_session: Optional[RTPSession] = None, payload_type: int = 0) -> str:
         """Build 200 OK response for INVITE"""
         # Use external IP for RTP so Asterisk can reach us
         sdp_ip = self.external_ip or self.local_ip
@@ -1495,15 +1555,22 @@ class SIPClient:
             self.rtp_session = rtp
 
         ts = int(datetime.now().timestamp())
+
+        # Echo the codec we actually negotiated. Answering with a fixed
+        # "0 8" (PCMU/PCMA) regardless of what the caller offered caused a
+        # codec mismatch: Asterisk prefers G.722 (PT 9) for inbound calls, so it
+        # sent G.722 audio while we sent PCMU, and the caller heard silence.
+        codec_rtp = {0: "PCMU/8000", 8: "PCMA/8000", 9: "G722/8000"}.get(payload_type, "PCMU/8000")
         sdp_lines = [
             "v=0",
             f"o=- {ts} {ts} IN IP4 {sdp_ip}",
             "s=HFIB Voice Agent",
             f"c=IN IP4 {sdp_ip}",
             "t=0 0",
-            f"m=audio {rtp.local_port} RTP/AVP 0 8",
-            "a=rtpmap:0 PCMU/8000",
-            "a=rtpmap:8 PCMA/8000",
+            f"m=audio {rtp.local_port} RTP/AVP {payload_type}",
+            f"a=rtpmap:{payload_type} {codec_rtp}",
+            "a=sendrecv",
+            "a=ptime:20",
             "",
         ]
         sdp = "\r\n".join(sdp_lines)
