@@ -616,7 +616,9 @@ class OpenClawVoice:
         else:
             instructions = INBOUND_UNAUTH_INSTRUCTIONS
 
-        instructions = self._compose_instructions(instructions)
+        instructions = self._compose_instructions(
+            instructions, caller_number=remote, number_label="The caller ID"
+        )
         session.task_context = instructions
 
         if not self.call_manager.add(session):
@@ -626,7 +628,8 @@ class OpenClawVoice:
 
         await self._run_call(session, instructions, is_inbound=True)
 
-    def _compose_instructions(self, base: str) -> str:
+    def _compose_instructions(self, base: str, caller_number: Optional[str] = None,
+                              number_label: str = "The caller's number") -> str:
         """Prepend the configured persona to the session instructions.
 
         `xai.instructions` in config.yaml was previously dead config — it was
@@ -640,21 +643,31 @@ class OpenClawVoice:
         else:
             base = f"{persona}\n\n{base}"
 
-        callback = self._callback_block()
+        callback = self._callback_block(caller_number, number_label)
         if callback:
             base = f"{base}\n\n{callback}"
         return base
 
-    def _callback_block(self) -> str:
+    def _callback_block(self, caller_number: Optional[str] = None,
+                        number_label: str = "The caller's number") -> str:
         """Build the per-customer callback instructions, if configured.
 
         Without this the agent had no way to tell a caller where to call
         back -- it said "call Alex back" by name only, because no callback
         number existed anywhere in the config.
 
-        If `callback.number` is empty we fall back to "the same number you
-        just called", which is always correct for a receptionist: the DID
-        the caller dialled is by definition the number they can call back on.
+        There is deliberately NO fallback to "the number you just called".
+        The line this daemon answers on is extension 100, which has no
+        external DID: a caller who dialled 100 cannot be called back on 100,
+        so offering it would send them nowhere. The line's own number is
+        never a callback number.
+
+        Two safe behaviours instead:
+          - If the caller's own number is known (a real caller ID from the
+            From header, or the number we dialled on an outbound call), use
+            it for the callback.
+          - Otherwise ask the caller for a callback number and read it back.
+        Never invent a number.
         """
         cb = self.config.get('callback') or {}
         number = str(cb.get('number') or '').strip()
@@ -668,24 +681,39 @@ class OpenClawVoice:
                 f"exactly as written: {number}. Never guess or invent a number."
             )
 
-        if cb:
-            # callback block present but no number: use the safe fallback.
-            # We must not invent a number. The receptionist behaviour that is
-            # always correct is to ask the caller for their callback number
-            # and read it back to confirm it.
+        # No configured callback number. This line has none of its own, so
+        # the only safe source of a callback number is the caller.
+        known = str(caller_number or '').strip()
+        if known and known.lower() not in ('unknown', 'anonymous', 'none', 'null'):
             return (
-                f"CALLBACK DETAILS: if the caller asks you to call them back, or "
-                f"if they want to leave a message, ask them for a callback number "
-                f"and read it back exactly as they said it to confirm. Do not "
-                f"guess, invent, or guess at any phone number."
+                f"CALLBACK DETAILS: this line has no callback number of its own — "
+                f"never offer the line or extension you answered on as a number to "
+                f"call back on. {number_label} on this call is {known}. If the caller "
+                f"asks you to call them back, use {known} with schedule_outbound_call, "
+                f"and confirm the number back to them. Never guess or invent a number."
             )
+
+        return (
+            f"CALLBACK DETAILS: this line has no callback number of its own — "
+            f"never offer the line or extension you answered on as a number to call "
+            f"back on. If the caller asks you to call them back, or if they want to "
+            f"leave a message, ask them for a callback number and read it back "
+            f"exactly as they said it to confirm, then use it with "
+            f"schedule_outbound_call. Never guess, invent, or guess at any phone "
+            f"number."
+        )
+
         return ""
 
     # ---- Outbound call handling ------------------------------------------
 
     async def make_outbound_call(self, number: str, task: str) -> Optional[str]:
         """Initiate an outbound call. Returns call_id or None on failure."""
-        instructions = self._compose_instructions(OUTBOUND_TEMPLATE.format(task=task))
+        instructions = self._compose_instructions(
+            OUTBOUND_TEMPLATE.format(task=task),
+            caller_number=number,
+            number_label="The number you called",
+        )
         call_id_holder = {}
 
         async def outbound_handler(rtp_session: RTPSession, codec: int, call_id: str):
@@ -1031,7 +1059,11 @@ class OpenClawVoice:
                     config = {
                         "type": "session.update",
                         "session": {
-                            "instructions": self._compose_instructions(INBOUND_AUTH_INSTRUCTIONS),
+                            "instructions": self._compose_instructions(
+                                INBOUND_AUTH_INSTRUCTIONS,
+                                caller_number=session.remote_number,
+                                number_label="The caller ID",
+                            ),
                             "tools": TOOLS_AUTHENTICATED,
                         }
                     }

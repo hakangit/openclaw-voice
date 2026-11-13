@@ -133,6 +133,14 @@ class XAIVoiceBridge:
 
     async def _configure_session(self):
         """Send session configuration to xAI."""
+        # Log the composed instructions so the effective prompt is
+        # observable in the journal. Phone prompts are the only way to
+        # verify that persona/callback/tool-gating text actually reached
+        # the model, and they are invisible once the call is over.
+        logger.info(
+            f"xAI session instructions ({len(self.instructions)} chars): "
+            f"{self.instructions[:4000]}"
+        )
         config = {
             "type": "session.update",
             "session": {
