@@ -17,7 +17,7 @@ the code itself.
         ┌─────────────────────────────────┼─────────────────────────────────┐
         │                                 │                                 │
 ┌───────▼────────┐              ┌────────▼───────┐              ┌──────────▼───────┐
-│ @customer1         │              │ @acme          │              │ @globex          │
+│ @customer1    │              │ @acme          │              │ @globex          │
 │ config.yaml    │              │ config.yaml    │              │ config.yaml      │
 │ .env (600)     │              │ .env (600)     │              │ .env (600)       │
 │ persona.md     │              │ persona.md     │              │ persona.md       │
@@ -27,8 +27,8 @@ the code itself.
 └───────┬────────┘              └────────┬───────┘              └──────────┬───────┘
         │                                 │                                 │
 ┌───────▼────────┐              ┌────────▼───────┐              ┌──────────▼───────┐
-│ sip.customer1 │              │ sip.acme.com   │              │ pbx.globex.com   │
-│ ext 100        │              │ ext 299        │              │ ext 399          │
+│ sip.customer1   │              │ sip.acme.com   │              │ pbx.globex.com   │
+│ ext 100         │              │ ext 299        │              │ ext 399          │
 └────────────────┘              └────────────────┘              └──────────────────┘
 ```
 
