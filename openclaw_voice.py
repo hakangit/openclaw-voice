@@ -283,6 +283,11 @@ to answer questions that would require tools until authenticated.
 
 STYLE: Be natural, conversational, and concise. You're on a phone call."""
 
+# Maximum number of wrong PINs a single caller may try on one call. Without
+# a cap, a caller can keep guessing a short PIN for the lifetime of the
+# call. After the cap is hit the authenticate tool stops accepting PINs.
+MAX_PIN_ATTEMPTS = 5
+
 INBOUND_AUTH_INSTRUCTIONS = """\
 You are a helpful voice assistant. The user is calling you on the phone.
 
@@ -339,9 +344,16 @@ class CallSession:
     bridge: Optional[XAIVoiceBridge] = None
     task_context: str = ''
     started_at: float = field(default_factory=time.time)
+    # Set when the call was torn down. `duration_s` is measured from
+    # started_at to ended_at, so a finished call reports its real length
+    # instead of growing forever.
+    ended_at: Optional[float] = None
     task: Optional[asyncio.Task] = None
     codec: int = 0
     authenticated: bool = False
+    # Number of failed PIN attempts on this call. Used to stop a caller
+    # brute-forcing the PIN; see MAX_PIN_ATTEMPTS.
+    pin_attempts: int = 0
     # Set once a hangup has been scheduled, so repeated hangup_call requests
     # (the model sometimes says goodbye over and over) do not queue extra
     # end-call tasks.
@@ -358,9 +370,14 @@ class CallSession:
 # ---------------------------------------------------------------------------
 
 class CallManager:
-    def __init__(self, max_concurrent: int = 3):
+    def __init__(self, max_concurrent: int = 3, max_history: int = 50):
         self.calls: dict[str, CallSession] = {}
         self.max_concurrent = max_concurrent
+        # How many finished calls to keep for the /calls listing. Without a
+        # cap, every call the daemon ever served stayed in memory forever --
+        # an unbounded leak on a long-running host. Oldest finished calls are
+        # evicted first.
+        self.max_history = max_history
 
     def add(self, session: CallSession) -> bool:
         active = sum(1 for s in self.calls.values() if s.state != 'ended')
@@ -373,6 +390,19 @@ class CallManager:
         session = self.calls.get(call_id)
         if session:
             session.state = 'ended'
+            if session.ended_at is None:
+                session.ended_at = time.time()
+            self._evict_old_history()
+
+    def _evict_old_history(self):
+        """Drop the oldest finished calls once the history cap is exceeded."""
+        if self.max_history <= 0:
+            return
+        finished = [s for s in self.calls.values() if s.state == 'ended']
+        # `finished` is in insertion order, so the head is the oldest.
+        while len(finished) > self.max_history:
+            oldest = finished.pop(0)
+            self.calls.pop(oldest.call_id, None)
 
     def get(self, call_id: str) -> Optional[CallSession]:
         return self.calls.get(call_id)
@@ -383,7 +413,8 @@ class CallManager:
     def to_list(self) -> list[dict]:
         result = []
         for s in self.calls.values():
-            duration = int(time.time() - s.started_at)
+            end = s.ended_at if s.ended_at is not None else time.time()
+            duration = int(end - s.started_at)
             result.append({
                 'call_id': s.call_id,
                 'direction': s.direction,
@@ -461,7 +492,8 @@ class OpenClawVoice:
         self.config = config
         self.sip_client: Optional[SIPClient] = None
         self.call_manager = CallManager(
-            max_concurrent=config.get('daemon', {}).get('max_concurrent_calls', 3)
+            max_concurrent=config.get('daemon', {}).get('max_concurrent_calls', 3),
+            max_history=config.get('daemon', {}).get('max_call_history', 50),
         )
         self.api_port = config.get('daemon', {}).get('api_port', 8080)
 
@@ -576,16 +608,30 @@ class OpenClawVoice:
                 return True
         return False
 
-    async def _on_inbound_call(self, rtp_session: RTPSession, negotiated_codec: int, call_id: str):
-        """Called by SIPClient when an inbound INVITE is answered."""
-        call_state = self.sip_client._active_calls.get(call_id, {})
-        remote = call_state.get('remote_number', 'unknown')
-        logger.info(f"Inbound call {call_id[:16]} from {remote}")
+    def _auth_gate(self, remote: str) -> tuple[bool, bool]:
+        """Decide the auth state for an inbound caller.
 
-        # Check if auth is configured
+        Returns ``(has_auth, pre_authenticated)``:
+
+        * ``has_auth`` -- a PIN gate is active and a usable PIN is
+          configured. When True, the caller must authenticate (or be
+          whitelisted) before privileged tools are exposed.
+        * ``pre_authenticated`` -- the caller may skip the PIN step.
+
+        Fail CLOSED, never open. ``auth.require_pin: true`` combined with a
+        PIN that did not resolve (missing env var, unsubstituted
+        ``${OPENCLAW_AUTH_PIN}``) used to leave ``has_auth`` False and
+        ``pre_authenticated`` True, silently granting the caller the FULL
+        privileged toolset -- process_query (shell access), outbound calling,
+        and conference bridging. A misconfiguration therefore handed an
+        anonymous caller the whole host. Here a broken PIN configuration
+        means nobody can authenticate, but nobody gets an unlocked door
+        either.
+        """
+        auth = self.config.get('auth', {}) or {}
         # A numeric PIN can parse as a YAML int, so coerce to str before
         # calling string methods on it.
-        auth_pin = str(self.config.get('auth', {}).get('pin', '') or '')
+        auth_pin = str(auth.get('pin', '') or '')
         # `auth.require_pin` is the explicit switch. It defaults to FALSE so
         # that merely having OPENCLAW_AUTH_PIN in .env no longer silently
         # strips every tool from the model. Previously a non-empty PIN meant
@@ -593,11 +639,33 @@ class OpenClawVoice:
         # schedule an outbound call -- and instead hallucinated "I can only
         # place one call at a time". The receptionist product intent is "no
         # inbound PIN", so callers get the full toolset by default.
-        require_pin = bool((self.config.get('auth', {}) or {}).get('require_pin', False))
+        require_pin = bool(auth.get('require_pin', False))
         has_auth = require_pin and bool(auth_pin and not auth_pin.startswith('${'))
 
-        # Auto-authenticate whitelisted callers or if no PIN configured
-        pre_authenticated = not has_auth or self._is_whitelisted(remote)
+        if require_pin and not has_auth:
+            logger.error(
+                "auth.require_pin is true but no usable PIN is configured "
+                "(value is empty or still an unsubstituted placeholder). "
+                "The PIN gate is enforced, but NO caller can authenticate "
+                "until OPENCLAW_AUTH_PIN is set in this instance's .env. "
+                "Privileged tools are withheld."
+            )
+            return False, False
+
+        if not require_pin:
+            # No inbound PIN requested -- the product default.
+            return False, True
+
+        # A gate is active. Only an explicitly whitelisted caller skips it.
+        return True, self._is_whitelisted(remote)
+
+    async def _on_inbound_call(self, rtp_session: RTPSession, negotiated_codec: int, call_id: str):
+        """Called by SIPClient when an inbound INVITE is answered."""
+        call_state = self.sip_client._active_calls.get(call_id, {})
+        remote = call_state.get('remote_number', 'unknown')
+        logger.info(f"Inbound call {call_id[:16]} from {remote}")
+
+        has_auth, pre_authenticated = self._auth_gate(remote)
         if pre_authenticated and has_auth:
             logger.info(f"Caller {remote} is whitelisted, skipping PIN")
 
@@ -1043,14 +1111,47 @@ class OpenClawVoice:
         if name == "authenticate":
             pin = str(args.get("pin", "") or "").strip()
             expected = str(self.config.get('auth', {}).get('pin', '') or '')
+            require_pin = bool((self.config.get('auth', {}) or {}).get('require_pin', False))
+
+            if require_pin and (not expected or expected.startswith('${')):
+                # Fail CLOSED. The PIN gate was requested but no usable PIN
+                # is configured, so nobody can pass it. Previously this
+                # auto-passed and handed an unauthenticated caller the full
+                # privileged toolset (process_query = shell access).
+                logger.error(
+                    "Authentication attempted but no usable PIN is "
+                    "configured; refusing to authenticate."
+                )
+                return (
+                    "Authentication is unavailable right now. Please try "
+                    "calling back later."
+                )
+
+            if session.pin_attempts >= MAX_PIN_ATTEMPTS:
+                logger.warning(
+                    f"Too many wrong PIN attempts from {session.remote_number}; "
+                    f"authentication disabled for this call"
+                )
+                return (
+                    "Too many incorrect PIN attempts. Please hang up and "
+                    "call back if you still need help."
+                )
+
             if not expected or expected.startswith('${'):
-                # No PIN configured, auto-pass
+                # No PIN gate requested at all -- nothing to verify.
                 session.authenticated = True
             elif pin == expected:
                 session.authenticated = True
             else:
+                session.pin_attempts += 1
+                remaining = max(0, MAX_PIN_ATTEMPTS - session.pin_attempts)
                 logger.warning(f"Bad PIN attempt from {session.remote_number}")
-                return "Wrong PIN. Please try again."
+                if remaining == 0:
+                    return (
+                        "Too many incorrect PIN attempts. Please hang up and "
+                        "call back if you still need help."
+                    )
+                return f"Wrong PIN. Please try again. ({remaining} attempts left)"
 
             if session.authenticated:
                 logger.info(f"Caller {session.remote_number} authenticated on {session.call_id[:16]}")
