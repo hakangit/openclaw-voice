@@ -1329,6 +1329,14 @@ class OpenClawVoice:
             'uptime_s': int(time.time() - self._start_time) if hasattr(self, '_start_time') else 0,
         }
 
+        # How long ago the extension last registered successfully. The
+        # `registered` flag alone can be stale (it is cleared on failure), so a
+        # consumer needs the age to tell "registered just now" from "has not
+        # managed to register since start".
+        if self.sip_client and getattr(self.sip_client, 'registered_at', None):
+            health['registered_at'] = self.sip_client.registered_at
+            health['registered_age_s'] = int(time.time() - self.sip_client.registered_at)
+
         # Per-customer identity, so a fleet health check can tell which
         # instance is which and which extension it answers on.
         if self.instance:

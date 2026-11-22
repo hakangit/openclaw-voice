@@ -18,6 +18,12 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+# How long to wait before retrying a failed re-registration. A re-register
+# tears the old contact down before creating the new one, so a failed attempt
+# leaves the extension unregistered on the PBX; retrying soon keeps that
+# outage window short instead of waiting for the next scheduled slot.
+SIP_RE_REGISTER_RETRY_SECONDS = 30
+
 
 class RTPSession:
     """Minimal RTP session for audio streaming"""
@@ -239,6 +245,9 @@ class SIPClient:
         self.cseq = 1
 
         self.registered = False
+        # Wall-clock time of the last SUCCESSFUL registration, so health can
+        # report how fresh the registration is rather than just a flag.
+        self.registered_at: Optional[float] = None
         self.active_call = None
         self.rtp_session: Optional[RTPSession] = None
         self.negotiated_codec: int = 0  # 0=PCMU, 9=G.722
@@ -250,6 +259,13 @@ class SIPClient:
 
         self.running = False
         self._re_register_task: Optional[asyncio.Task] = None
+        # True while a re-registration loop should keep running. Set when a
+        # registration succeeds, cleared on stop(). This is deliberately
+        # separate from `registered`, which only describes the last attempt.
+        self._re_register_enabled = False
+        # The server-granted re-register cadence, restored after a failed
+        # attempt retries on the short backoff.
+        self._normal_re_register_interval = 900
 
         # Asyncio transport (set by listen_for_calls)
         self._transport = None
@@ -496,7 +512,21 @@ class SIPClient:
 
         Phase 1: Clears all stale contacts first via unregister_all().
         Phase 2: Parses server-granted Expires and schedules re-register at half.
+
+        On any failure path the `registered` flag and its timestamp are
+        cleared. `register()` tears the old contact down (Contact: *,
+        Expires: 0) before creating the new one, so once an attempt fails the
+        extension really is unregistered at the PBX. Leaving the old value in
+        place made /health report "registered" after a failed
+        re-registration — the daemon looked healthy precisely while it was
+        deaf, which is the one thing this flag exists to prevent.
+
+        The flag is only cleared once the attempt has failed, not while it is
+        in flight: during the brief re-register window the previous
+        registration may still be serving callers, and flipping the flag
+        early would cause spurious outage alarms.
         """
+        succeeded = False
         try:
             # Phase 1: Clear stale registrations
             await self.unregister_all()
@@ -527,6 +557,8 @@ class SIPClient:
             if 'SIP/2.0 200 OK' in response_text:
                 logger.info("Server accepted registration without authentication")
                 self.registered = True
+                self.registered_at = time.time()
+                succeeded = True
                 server_expires = self._parse_server_expires(response_text)
                 self._log_contacts(response_text)
                 self._schedule_re_register(server_expires // 2)
@@ -605,6 +637,8 @@ class SIPClient:
 
                 if first_line.startswith('SIP/2.0 200'):
                     self.registered = True
+                    self.registered_at = time.time()
+                    succeeded = True
                     server_expires = self._parse_server_expires(response_text)
                     self._log_contacts(response_text)
                     interval = max(server_expires // 2, 15)
@@ -629,6 +663,12 @@ class SIPClient:
             if self.call_id:
                 self._remove_response_queue(self.call_id)
             return False
+        finally:
+            if not succeeded:
+                # The attempt failed, so the extension is not registered at the
+                # PBX. Say so, rather than reporting a stale success.
+                self.registered = False
+                self.registered_at = None
 
     def _log_contacts(self, response_text: str):
         """Log Contact headers from a registration response."""
@@ -703,6 +743,8 @@ class SIPClient:
         """Schedule periodic re-registration. Default 900s (half of typical 1800s expiry)."""
         if self._re_register_task and not self._re_register_task.done():
             self._re_register_task.cancel()
+        self._re_register_enabled = True
+        self._normal_re_register_interval = max(interval, SIP_RE_REGISTER_RETRY_SECONDS)
         try:
             loop = asyncio.get_event_loop()
             self._re_register_task = loop.create_task(self._re_register_loop(interval))
@@ -710,18 +752,36 @@ class SIPClient:
             logger.warning("No event loop available for re-registration scheduling")
 
     async def _re_register_loop(self, interval: int):
-        """Periodically re-register to keep registration alive."""
-        while self.running or self.registered:
+        """Periodically re-register to keep registration alive.
+
+        A failed attempt must NOT end this loop. `register()` clears
+        `self.registered` when an attempt fails, so keying the loop on that
+        flag would make a single failed re-registration permanently abandon the
+        extension — the worst possible outcome, because the PBX has already
+        dropped the contact by then. The loop is therefore keyed on
+        `_re_register_enabled`, and a failed attempt is retried on a short
+        interval to shrink the outage window.
+        """
+        while self.running or self._re_register_enabled:
             await asyncio.sleep(interval)
-            if not self.registered:
+            if not self._re_register_enabled:
                 break
             logger.info(f"Re-registering (interval={interval}s)")
             try:
                 result = await self.register()
                 if not result:
-                    logger.error("Re-registration failed")
+                    logger.error(
+                        "Re-registration failed; retrying in %ss",
+                        SIP_RE_REGISTER_RETRY_SECONDS,
+                    )
+                    interval = SIP_RE_REGISTER_RETRY_SECONDS
+                else:
+                    # register() schedules a fresh loop with the server-granted
+                    # interval on success, so restore the normal cadence here.
+                    interval = self._normal_re_register_interval
             except Exception as e:
                 logger.error(f"Re-registration error: {e}")
+                interval = SIP_RE_REGISTER_RETRY_SECONDS
 
     # ------------------------------------------------------------------
     # Outbound calls
@@ -1855,6 +1915,8 @@ class SIPClient:
         """Stop SIP client and hang up all active calls."""
         self.running = False
         self.registered = False
+        self.registered_at = None
+        self._re_register_enabled = False
         if self._keepalive_task and not self._keepalive_task.done():
             self._keepalive_task.cancel()
         if self._re_register_task and not self._re_register_task.done():
