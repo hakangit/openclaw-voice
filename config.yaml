@@ -27,6 +27,9 @@ audio:
 daemon:
   api_port: 8079
   max_concurrent_calls: 3
+  # How many finished calls to keep in memory for the /calls listing.
+  # Without a cap the daemon retains every call it ever served.
+  max_call_history: 50
 
 # OpenClaw Gateway integration
 openclaw:
@@ -36,8 +39,14 @@ openclaw:
 
 # Authentication
 auth:
+  # The shared single-tenant config. The customer instance for customer1 uses
+  # its own config (see /etc/openclaw-voice/customers/customer1/config.yaml),
+  # which requires a PIN. This shared config is kept fail-closed so that a
+  # misconfigured or accidental start of the legacy plain unit cannot hand
+  # an anonymous caller the privileged toolset.
+  require_pin: true
   pin: ${OPENCLAW_AUTH_PIN}
-  whitelist: []  # caller numbers that skip PIN (e.g. ["+15551234567"])
+  whitelist: []  # caller numbers that skip PIN (e.g. ["+1555XXXX567"])
 
 # Logging
 logging:

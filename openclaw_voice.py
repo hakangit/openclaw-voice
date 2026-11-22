@@ -29,6 +29,7 @@ Architecture:
 """
 
 import argparse
+import audioop
 import asyncio
 import base64
 import json
@@ -70,20 +71,92 @@ logger = logging.getLogger('openclaw_voice')
 
 def load_config() -> dict:
     """Load configuration from config.yaml with env var substitution."""
-    load_dotenv()
+    # Per-instance env file. Each customer instance has its own secrets file
+    # (SIP password, xAI key, gateway token) so instances stay isolated from
+    # each other. Falls back to the shared .env for the original single-tenant
+    # deployment.
+    env_override = os.getenv('OPENCLAW_VOICE_ENV', '').strip()
+    if env_override:
+        env_path = Path(env_override)
+        if not env_path.is_absolute():
+            env_path = Path(__file__).parent / env_path
+        if env_path.exists():
+            load_dotenv(env_path, override=True)
+        else:
+            logger.warning(
+                f"OPENCLAW_VOICE_ENV={env_override} does not exist, "
+                f"falling back to shared .env"
+            )
+    else:
+        load_dotenv()
+
     config_path = Path(__file__).parent / "config.yaml"
+
+    # Per-instance override: OPENCLAW_VOICE_CONFIG points at a customer-specific
+    # config.yaml. This is what makes one daemon serve many customers -- each
+    # systemd template instance gets its own file instead of sharing one.
+    override = os.getenv('OPENCLAW_VOICE_CONFIG', '').strip()
+    if override:
+        override_path = Path(override)
+        if not override_path.is_absolute():
+            override_path = Path(__file__).parent / override_path
+        if override_path.exists():
+            config_path = override_path
+        else:
+            logger.warning(
+                f"OPENCLAW_VOICE_CONFIG={override} does not exist, "
+                f"falling back to {config_path}"
+            )
+
     with open(config_path) as f:
         config_str = f.read()
     for key in ['XAI_API_KEY', 'SIP_PASSWORD', 'OPENCLAW_GATEWAY_TOKEN', 'OPENCLAW_AUTH_PIN']:
         placeholder = f'${{{key}}}'
         if placeholder in config_str:
             config_str = config_str.replace(placeholder, os.getenv(key, placeholder))
-    return yaml.safe_load(config_str)
+    config = yaml.safe_load(config_str)
+    config['_config_path'] = str(config_path)
+
+    # Per-instance OpenClaw session key. Every customer instance shares the
+    # same OpenClaw gateway, so a shared session key would put every
+    # customer's process_query conversations into ONE OpenClaw session --
+    # leaking context (and potentially private data) between customers.
+    # Derive an instance-scoped key unless the configured one already
+    # references the instance.
+    instance_id = os.getenv('OPENCLAW_VOICE_INSTANCE', '').strip()
+    if instance_id:
+        openclaw_cfg = config.setdefault('openclaw', {})
+        configured_key = str(openclaw_cfg.get('session_key') or '').strip()
+        if instance_id not in configured_key:
+            openclaw_cfg['session_key'] = f"openclaw-voice-{instance_id}"
+            logger.info(
+                f"Scoped OpenClaw session key for instance '{instance_id}'"
+            )
+
+    return config
 
 
 # ---------------------------------------------------------------------------
 # Tool definitions for xAI voice agent
 # ---------------------------------------------------------------------------
+
+def _redact_tool_args(args: dict) -> dict:
+    """Redact credential-bearing tool arguments before logging.
+
+    The `authenticate` tool carries the caller's PIN in its `pin` argument, and
+    logging tool args verbatim wrote the PIN to the journal on every successful
+    authentication. Other secret-shaped fields are masked too, in case a
+    provider starts passing one through a different tool.
+    """
+    secret_keys = {"pin", "password", "secret", "token", "api_key", "apikey", "key"}
+    redacted = {}
+    for key, value in (args or {}).items():
+        if str(key).strip().lower() in secret_keys:
+            redacted[key] = "***"
+        else:
+            redacted[key] = value
+    return redacted
+
 
 TOOL_AUTHENTICATE = {
     "type": "function",
@@ -164,10 +237,42 @@ TOOLS_AUTHENTICATED = [
             "required": ["call_id"]
         }
     },
+    {
+        "type": "function",
+        "name": "hangup_call",
+        "description": (
+            "End the current phone call. Use this when the conversation is over "
+            "or the other party asks you to hang up. Without this you cannot "
+            "end the call yourself — say goodbye, then call this tool."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Why the call is ending (e.g. 'conversation complete')"
+                }
+            },
+            "required": []
+        }
+    },
+]
+
+# hangup_call is exposed even to unauthenticated callers: ending a call
+# must always be possible.
+TOOL_HANGUP = next(
+    tool for tool in TOOLS_AUTHENTICATED if tool["name"] == "hangup_call"
+)
+
+# Tools available on outbound calls. Outbound calls are dialled by us via the
+# control API, so the caller has already been authorised by whoever placed
+# the call. The agent needs hangup_call so it can end the call itself.
+TOOLS_OUTBOUND = [
+    tool for tool in TOOLS_AUTHENTICATED if tool["name"] == "hangup_call"
 ]
 
 INBOUND_UNAUTH_INSTRUCTIONS = """\
-You are OpenClaw, a helpful voice assistant. The user is calling you on the phone.
+You are a helpful voice assistant. The user is calling you on the phone.
 
 The caller has NOT been authenticated yet. You can have a basic conversation, but \
 you CANNOT use any tools until they provide their PIN.
@@ -178,16 +283,26 @@ to answer questions that would require tools until authenticated.
 
 STYLE: Be natural, conversational, and concise. You're on a phone call."""
 
+# Maximum number of wrong PINs a single caller may try on one call. Without
+# a cap, a caller can keep guessing a short PIN for the lifetime of the
+# call. After the cap is hit the authenticate tool stops accepting PINs.
+MAX_PIN_ATTEMPTS = 5
+
 INBOUND_AUTH_INSTRUCTIONS = """\
-You are OpenClaw, a helpful voice assistant. The user is calling you on the phone.
+You are a helpful voice assistant. The user is calling you on the phone.
 
 CAPABILITIES:
 - Answer questions, have conversations
 - Run commands and check system status via process_query
 - Make outbound calls on the user's behalf via schedule_outbound_call
 - Bridge calls together via connect_to_call
+- End the current call via hangup_call
 
 STYLE: Be natural, conversational, and concise. You're on a phone call.
+
+ENDING THE CALL: When the conversation is finished, or the caller asks you to
+hang up, say your goodbye FIRST and then call the hangup_call tool. If you skip
+the tool, nobody can end the call except the other party.
 
 IMPORTANT: When you need to use a tool, ALWAYS say something first like "let me check \
 on that", "one sec", or "hang on, let me look that up" BEFORE calling the tool. Tools \
@@ -204,11 +319,15 @@ You are OpenClaw, making a phone call on behalf of your user.
 YOUR TASK: {task}
 
 RULES:
-- Identify yourself as OpenClaw, a voice assistant calling on behalf of your user
+- Identify yourself using the name given in your persona instructions, and say you are calling on behalf of your user
 - Stay focused on the task
 - Be polite and professional
 - Confirm outcomes before hanging up
-- Say goodbye when done"""
+- Say goodbye when done
+
+ENDING THE CALL: when you have finished the task and said goodbye, call the
+hangup_call tool to end the call. If you do not call it, nobody can end the
+call except the other party."""
 
 
 # ---------------------------------------------------------------------------
@@ -225,11 +344,25 @@ class CallSession:
     bridge: Optional[XAIVoiceBridge] = None
     task_context: str = ''
     started_at: float = field(default_factory=time.time)
+    # Set when the call was torn down. `duration_s` is measured from
+    # started_at to ended_at, so a finished call reports its real length
+    # instead of growing forever.
+    ended_at: Optional[float] = None
     task: Optional[asyncio.Task] = None
     codec: int = 0
     authenticated: bool = False
+    # Number of failed PIN attempts on this call. Used to stop a caller
+    # brute-forcing the PIN; see MAX_PIN_ATTEMPTS.
+    pin_attempts: int = 0
+    # Set once a hangup has been scheduled, so repeated hangup_call requests
+    # (the model sometimes says goodbye over and over) do not queue extra
+    # end-call tasks.
+    hangup_scheduled: bool = False
     # Conference: when set, outbound RTP audio is also forwarded to this session
     conference_peer: Optional['CallSession'] = None
+    # Set when the call has been torn down at the SIP level, so a late
+    # watchdog tick does not send a second BYE.
+    bye_sent: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +370,14 @@ class CallSession:
 # ---------------------------------------------------------------------------
 
 class CallManager:
-    def __init__(self, max_concurrent: int = 3):
+    def __init__(self, max_concurrent: int = 3, max_history: int = 50):
         self.calls: dict[str, CallSession] = {}
         self.max_concurrent = max_concurrent
+        # How many finished calls to keep for the /calls listing. Without a
+        # cap, every call the daemon ever served stayed in memory forever --
+        # an unbounded leak on a long-running host. Oldest finished calls are
+        # evicted first.
+        self.max_history = max_history
 
     def add(self, session: CallSession) -> bool:
         active = sum(1 for s in self.calls.values() if s.state != 'ended')
@@ -252,6 +390,19 @@ class CallManager:
         session = self.calls.get(call_id)
         if session:
             session.state = 'ended'
+            if session.ended_at is None:
+                session.ended_at = time.time()
+            self._evict_old_history()
+
+    def _evict_old_history(self):
+        """Drop the oldest finished calls once the history cap is exceeded."""
+        if self.max_history <= 0:
+            return
+        finished = [s for s in self.calls.values() if s.state == 'ended']
+        # `finished` is in insertion order, so the head is the oldest.
+        while len(finished) > self.max_history:
+            oldest = finished.pop(0)
+            self.calls.pop(oldest.call_id, None)
 
     def get(self, call_id: str) -> Optional[CallSession]:
         return self.calls.get(call_id)
@@ -262,7 +413,8 @@ class CallManager:
     def to_list(self) -> list[dict]:
         result = []
         for s in self.calls.values():
-            duration = int(time.time() - s.started_at)
+            end = s.ended_at if s.ended_at is not None else time.time()
+            duration = int(end - s.started_at)
             result.append({
                 'call_id': s.call_id,
                 'direction': s.direction,
@@ -340,9 +492,28 @@ class OpenClawVoice:
         self.config = config
         self.sip_client: Optional[SIPClient] = None
         self.call_manager = CallManager(
-            max_concurrent=config.get('daemon', {}).get('max_concurrent_calls', 3)
+            max_concurrent=config.get('daemon', {}).get('max_concurrent_calls', 3),
+            max_history=config.get('daemon', {}).get('max_call_history', 50),
         )
         self.api_port = config.get('daemon', {}).get('api_port', 8080)
+
+        # Multi-instance overrides. Two instances on one host cannot share a
+        # SIP listener or an HTTP API port, so each customer instance is
+        # started with its own. Config file is the source of truth; these
+        # env vars let the systemd template inject the per-instance values.
+        instance = os.getenv('OPENCLAW_VOICE_INSTANCE', '').strip()
+        self.instance = instance or None
+        if self.instance:
+            logger.info(f"Running as customer instance '{self.instance}'")
+
+        env_api_port = os.getenv('OPENCLAW_VOICE_API_PORT', '').strip()
+        if env_api_port:
+            self.api_port = int(env_api_port)
+
+        env_sip_port = os.getenv('OPENCLAW_VOICE_SIP_PORT', '').strip()
+        if env_sip_port:
+            self.config.setdefault('sip', {})['sip_local_port'] = int(env_sip_port)
+
         self.running = False
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
@@ -437,18 +608,64 @@ class OpenClawVoice:
                 return True
         return False
 
+    def _auth_gate(self, remote: str) -> tuple[bool, bool]:
+        """Decide the auth state for an inbound caller.
+
+        Returns ``(has_auth, pre_authenticated)``:
+
+        * ``has_auth`` -- a PIN gate is active and a usable PIN is
+          configured. When True, the caller must authenticate (or be
+          whitelisted) before privileged tools are exposed.
+        * ``pre_authenticated`` -- the caller may skip the PIN step.
+
+        Fail CLOSED, never open. ``auth.require_pin: true`` combined with a
+        PIN that did not resolve (missing env var, unsubstituted
+        ``${OPENCLAW_AUTH_PIN}``) used to leave ``has_auth`` False and
+        ``pre_authenticated`` True, silently granting the caller the FULL
+        privileged toolset -- process_query (shell access), outbound calling,
+        and conference bridging. A misconfiguration therefore handed an
+        anonymous caller the whole host. Here a broken PIN configuration
+        means nobody can authenticate, but nobody gets an unlocked door
+        either.
+        """
+        auth = self.config.get('auth', {}) or {}
+        # A numeric PIN can parse as a YAML int, so coerce to str before
+        # calling string methods on it.
+        auth_pin = str(auth.get('pin', '') or '')
+        # `auth.require_pin` is the explicit switch. It defaults to FALSE so
+        # that merely having OPENCLAW_AUTH_PIN in .env no longer silently
+        # strips every tool from the model. Previously a non-empty PIN meant
+        # the model was given ONLY the `authenticate` tool, so it could never
+        # schedule an outbound call -- and instead hallucinated "I can only
+        # place one call at a time". The receptionist product intent is "no
+        # inbound PIN", so callers get the full toolset by default.
+        require_pin = bool(auth.get('require_pin', False))
+        has_auth = require_pin and bool(auth_pin and not auth_pin.startswith('${'))
+
+        if require_pin and not has_auth:
+            logger.error(
+                "auth.require_pin is true but no usable PIN is configured "
+                "(value is empty or still an unsubstituted placeholder). "
+                "The PIN gate is enforced, but NO caller can authenticate "
+                "until OPENCLAW_AUTH_PIN is set in this instance's .env. "
+                "Privileged tools are withheld."
+            )
+            return False, False
+
+        if not require_pin:
+            # No inbound PIN requested -- the product default.
+            return False, True
+
+        # A gate is active. Only an explicitly whitelisted caller skips it.
+        return True, self._is_whitelisted(remote)
+
     async def _on_inbound_call(self, rtp_session: RTPSession, negotiated_codec: int, call_id: str):
         """Called by SIPClient when an inbound INVITE is answered."""
         call_state = self.sip_client._active_calls.get(call_id, {})
         remote = call_state.get('remote_number', 'unknown')
         logger.info(f"Inbound call {call_id[:16]} from {remote}")
 
-        # Check if auth is configured
-        auth_pin = self.config.get('auth', {}).get('pin', '')
-        has_auth = bool(auth_pin and not auth_pin.startswith('${'))
-
-        # Auto-authenticate whitelisted callers or if no PIN configured
-        pre_authenticated = not has_auth or self._is_whitelisted(remote)
+        has_auth, pre_authenticated = self._auth_gate(remote)
         if pre_authenticated and has_auth:
             logger.info(f"Caller {remote} is whitelisted, skipping PIN")
 
@@ -467,6 +684,9 @@ class OpenClawVoice:
         else:
             instructions = INBOUND_UNAUTH_INSTRUCTIONS
 
+        instructions = self._compose_instructions(
+            instructions, caller_number=remote, number_label="The caller ID"
+        )
         session.task_context = instructions
 
         if not self.call_manager.add(session):
@@ -476,11 +696,92 @@ class OpenClawVoice:
 
         await self._run_call(session, instructions, is_inbound=True)
 
+    def _compose_instructions(self, base: str, caller_number: Optional[str] = None,
+                              number_label: str = "The caller's number") -> str:
+        """Prepend the configured persona to the session instructions.
+
+        `xai.instructions` in config.yaml was previously dead config — it was
+        never read — so the spoken identity drifted between calls on the same
+        daemon ("OpenClaw" on one call, "Grok Voice" on the next).
+        """
+        persona = (self.config.get('xai') or {}).get('instructions') or ''
+        persona = persona.strip()
+        if not persona:
+            base = base
+        else:
+            base = f"{persona}\n\n{base}"
+
+        callback = self._callback_block(caller_number, number_label)
+        if callback:
+            base = f"{base}\n\n{callback}"
+        return base
+
+    def _callback_block(self, caller_number: Optional[str] = None,
+                        number_label: str = "The caller's number") -> str:
+        """Build the per-customer callback instructions, if configured.
+
+        Without this the agent had no way to tell a caller where to call
+        back -- it said "call Alex back" by name only, because no callback
+        number existed anywhere in the config.
+
+        There is deliberately NO fallback to "the number you just called".
+        The line this daemon answers on is extension 100, which has no
+        external DID: a caller who dialled 100 cannot be called back on 100,
+        so offering it would send them nowhere. The line's own number is
+        never a callback number.
+
+        Two safe behaviours instead:
+          - If the caller's own number is known (a real caller ID from the
+            From header, or the number we dialled on an outbound call), use
+            it for the callback.
+          - Otherwise ask the caller for a callback number and read it back.
+        Never invent a number.
+        """
+        cb = self.config.get('callback') or {}
+        number = str(cb.get('number') or '').strip()
+        name = str(cb.get('name') or '').strip()
+
+        if number:
+            who = f"{name} at {number}" if name else number
+            return (
+                f"CALLBACK DETAILS: if the caller asks you to call them back, or if "
+                f"you leave a message, tell them to call {who}. Read the number "
+                f"exactly as written: {number}. Never guess or invent a number."
+            )
+
+        # No configured callback number. This line has none of its own, so
+        # the only safe source of a callback number is the caller.
+        known = str(caller_number or '').strip()
+        if known and known.lower() not in ('unknown', 'anonymous', 'none', 'null'):
+            return (
+                f"CALLBACK DETAILS: this line has no callback number of its own — "
+                f"never offer the line or extension you answered on as a number to "
+                f"call back on. {number_label} on this call is {known}. If the caller "
+                f"asks you to call them back, use {known} with schedule_outbound_call, "
+                f"and confirm the number back to them. Never guess or invent a number."
+            )
+
+        return (
+            f"CALLBACK DETAILS: this line has no callback number of its own — "
+            f"never offer the line or extension you answered on as a number to call "
+            f"back on. If the caller asks you to call them back, or if they want to "
+            f"leave a message, ask them for a callback number and read it back "
+            f"exactly as they said it to confirm, then use it with "
+            f"schedule_outbound_call. Never guess, invent, or guess at any phone "
+            f"number."
+        )
+
+        return ""
+
     # ---- Outbound call handling ------------------------------------------
 
     async def make_outbound_call(self, number: str, task: str) -> Optional[str]:
         """Initiate an outbound call. Returns call_id or None on failure."""
-        instructions = OUTBOUND_TEMPLATE.format(task=task)
+        instructions = self._compose_instructions(
+            OUTBOUND_TEMPLATE.format(task=task),
+            caller_number=number,
+            number_label="The number you called",
+        )
         call_id_holder = {}
 
         async def outbound_handler(rtp_session: RTPSession, codec: int, call_id: str):
@@ -513,13 +814,19 @@ class OpenClawVoice:
 
         task_obj = asyncio.create_task(do_call())
 
-        # Wait briefly for call_id to be populated
-        for _ in range(50):  # 5 seconds max
+        # Wait briefly for make_call to assign a call_id. sip_client sets
+        # `last_call_id` as soon as it builds the INVITE, so we get the id
+        # within milliseconds instead of waiting for the call to be ANSWERED
+        # (up to 30s). Previously the API reported "call failed" for a call
+        # that was actually ringing and connecting.
+        for _ in range(30):  # 3 seconds max
             await asyncio.sleep(0.1)
-            if 'id' in call_id_holder:
+            if call_id_holder.get('id'):
                 return call_id_holder['id']
+            pending = getattr(self.sip_client, 'last_call_id', None)
+            if pending:
+                return pending
 
-        # Return a placeholder - the call might still connect
         return None
 
     # ---- Core call bridge ------------------------------------------------
@@ -528,11 +835,23 @@ class OpenClawVoice:
         """Run the audio bridge between SIP and xAI for one call."""
         # Pick tools based on auth state
         if not is_inbound:
-            tools = []
+            # Outbound calls are initiated by us (from the control API), so
+            # they are already trusted. They still need at least hangup_call,
+            # otherwise the agent can never end its own outbound call -- the
+            # party had to hang up manually ("I can't disconnect from my
+            # side" was the symptom).
+            tools = list(TOOLS_OUTBOUND)
         elif session.authenticated:
             tools = TOOLS_AUTHENTICATED
         else:
-            tools = [TOOL_AUTHENTICATE]
+            # The caller has not authenticated, so they only get the
+            # authenticate tool -- EXCEPT hangup_call, which must always be
+            # reachable. An unauthenticated caller who wants to leave must
+            # never be trapped on the line. The handler already treats
+            # hangup_call as never-gated; without exposing the tool here
+            # that promise was unreachable, because the model could not
+            # name a tool it was never given.
+            tools = [TOOL_AUTHENTICATE, TOOL_HANGUP]
 
         bridge = XAIVoiceBridge(
             api_key=self.config['xai']['api_key'],
@@ -541,11 +860,10 @@ class OpenClawVoice:
             tools=tools,
         )
 
-        # Set up tool handler for inbound calls
-        if is_inbound:
-            async def tool_handler(tool_call_id: str, name: str, args: dict):
-                return await self._handle_tool(session, tool_call_id, name, args)
-            bridge.on_tool_call = tool_handler
+        # Set up tool handler
+        async def tool_handler(tool_call_id: str, name: str, args: dict):
+            return await self._handle_tool(session, tool_call_id, name, args)
+        bridge.on_tool_call = tool_handler
 
         if not await bridge.connect():
             logger.error(f"Failed to connect xAI for call {session.call_id[:16]}")
@@ -573,6 +891,7 @@ class OpenClawVoice:
 
         async def sip_to_xai():
             """Forward audio from SIP to xAI."""
+            nonlocal running
             loop = asyncio.get_event_loop()
             await asyncio.sleep(2)
             logger.info(f"sip_to_xai active ({session.call_id[:16]})")
@@ -593,13 +912,31 @@ class OpenClawVoice:
                             continue
                         if (time.monotonic() - last_frame_sent_at) < ECHO_HOLD_S:
                             continue
+                        # The bridge speaks G.711 u-law (PCMU) only. If the
+                        # caller negotiated PCMA, convert on the way in so the
+                        # bridge receives the format it expects.
+                        #
+                        # G.722 (PT 9) is deliberately NOT converted: it is
+                        # ADPCM, not resampled u-law, so a rate conversion
+                        # produces noise. We never offer G.722, and if a peer
+                        # forces it we drop the frames rather than send garbage.
+                        if session.codec == 8:
+                            audio = audioop.lin2ulaw(audioop.ulaw2lin(audio, 2), 2)
+                        elif session.codec not in (0, 8):
+                            continue
                         await bridge.send_audio(audio)
                     else:
                         await asyncio.sleep(0.005)
                 except OSError:
-                    break  # RTP socket closed (call ended)
+                    # RTP socket closed — the remote party hung up. End the whole
+                    # call so the session slot and the xAI websocket are released
+                    # instead of leaking until the next call.
+                    logger.info(f"RTP session closed for call {session.call_id[:16]}; ending call")
+                    running = False
+                    break
                 except Exception as e:
                     logger.error(f"sip_to_xai error: {e}")
+                    running = False
                     break
 
         async def xai_to_sip():
@@ -611,7 +948,16 @@ class OpenClawVoice:
                 if frame:
                     nonlocal last_frame_sent_at
                     try:
-                        rtp.send_audio(frame, payload_type=0)
+                        # xAI emits PCMU. Re-encode only for PCMA; for anything
+                        # else (e.g. G.722) skip the frame instead of sending
+                        # undecodable noise.
+                        out_frame = frame
+                        if session.codec == 8:
+                            out_frame = audioop.lin2alaw(audioop.ulaw2lin(frame, 2), 2)
+                        elif session.codec not in (0, 8):
+                            await asyncio.sleep(RTP_FRAME_MS / 1000)
+                            continue
+                        rtp.send_audio(out_frame, payload_type=session.codec)
                     except OSError:
                         break  # RTP socket closed
                     last_frame_sent_at = time.monotonic()
@@ -624,19 +970,66 @@ class OpenClawVoice:
                     peer = session.conference_peer
                     if peer and peer.state == 'connected' and peer.rtp_session:
                         try:
-                            peer.rtp_session.send_audio(frame, payload_type=0)
+                            peer_frame = frame
+                            if peer.codec == 8:
+                                peer_frame = audioop.lin2alaw(audioop.ulaw2lin(frame, 2), 2)
+                            elif peer.codec not in (0, 8):
+                                continue
+                            peer.rtp_session.send_audio(peer_frame, payload_type=peer.codec)
                         except OSError:
                             pass
                     await asyncio.sleep(RTP_FRAME_MS / 1000)
                 else:
                     await asyncio.sleep(RTP_FRAME_MS / 1000)
 
+        # Wait for the FIRST loop to finish, then cancel the rest.
+        # asyncio.gather() waits for ALL of them, and xai_listener() blocks on
+        # the still-open xAI websocket — so a caller hangup left gather()
+        # pending forever and _end_call() never ran, leaking the call slot.
+        loops = [
+            asyncio.create_task(xai_listener()),
+            asyncio.create_task(sip_to_xai()),
+            asyncio.create_task(xai_to_sip()),
+        ]
+
+        # --- Max call duration guard -------------------------------------
+        #
+        # A stuck call (bad teardown, peer that never sends BYE) would hold a
+        # concurrency slot and burn xAI tokens forever. There was no ceiling
+        # at all before this.
+        max_duration = self._max_call_duration()
+        duration_task = None
+        if max_duration:
+            async def _duration_guard():
+                await asyncio.sleep(max_duration)
+                if running and session.state != 'ended':
+                    logger.warning(
+                        f"Call {session.call_id[:16]} hit the {max_duration}s "
+                        f"maximum duration; forcing teardown"
+                    )
+                    await self._end_call(session)
+            duration_task = asyncio.create_task(_duration_guard())
+
         try:
-            await asyncio.gather(xai_listener(), sip_to_xai(), xai_to_sip())
+            done, pending = await asyncio.wait(loops, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
         except asyncio.CancelledError:
             pass
         finally:
+            if duration_task and not duration_task.done():
+                duration_task.cancel()
             await self._end_call(session)
+
+    def _max_call_duration(self) -> int:
+        """Maximum call duration in seconds (0 = unlimited)."""
+        raw = (self.config.get('daemon') or {}).get('max_call_duration_s', 0)
+        try:
+            value = int(raw or 0)
+        except (TypeError, ValueError):
+            return 0
+        return value if value > 0 else 0
 
     async def _end_call(self, session: CallSession):
         """Clean up a call session."""
@@ -663,9 +1056,17 @@ class OpenClawVoice:
         # Send SIP BYE
         if self.sip_client and session.call_id in self.sip_client._active_calls:
             try:
-                await self.sip_client.hangup(call_id=session.call_id)
+                ok = await self.sip_client.hangup(call_id=session.call_id)
+                session.bye_sent = bool(ok)
+                if not ok:
+                    logger.warning(
+                        f"BYE for {session.call_id[:16]} was not acknowledged; "
+                        f"attempting fallback teardown"
+                    )
+                    await self._force_teardown(session)
             except Exception as e:
                 logger.warning(f"Hangup error: {e}")
+                await self._force_teardown(session)
 
         # Cancel background task
         if session.task and not session.task.done():
@@ -673,23 +1074,84 @@ class OpenClawVoice:
 
         self.call_manager.remove(session.call_id)
 
+    async def _force_teardown(self, session: CallSession):
+        """Last-resort teardown when the normal BYE was not acknowledged.
+
+        If the peer rejects our BYE (e.g. 481) the SIP dialog may still be
+        alive on the PBX even though our side considers the call over. The
+        PBX has its own RTP timeout, so the call does eventually drop — but
+        the caller waits in silence for that long. This sends a bare RTP
+        teardown (RFC 3550 BYE packet) which the media stack treats as an
+        abrupt end, and then confirms the dialog state.
+        """
+        logger.warning(f"Forcing teardown for call {session.call_id[:16]}")
+        rtp = session.rtp_session
+        if rtp:
+            try:
+                close = getattr(rtp, 'close', None)
+                if close:
+                    close()
+            except Exception as e:
+                logger.warning(f"RTP force-close error: {e}")
+
+        # If the SIP dialog is still registered locally, drop it so the
+        # daemon stops tracking a call that no longer exists.
+        if self.sip_client:
+            try:
+                self.sip_client._active_calls.pop(session.call_id, None)
+            except Exception:
+                pass
+
     # ---- Tool execution --------------------------------------------------
 
     async def _handle_tool(self, session: CallSession, tool_call_id: str, name: str, args: dict) -> str:
         """Handle a tool call from xAI during an inbound call."""
-        logger.info(f"Tool call: {name}({args}) on call {session.call_id[:16]} auth={session.authenticated}")
+        logger.info(f"Tool call: {name}({_redact_tool_args(args)}) on call {session.call_id[:16]} auth={session.authenticated}")
 
         if name == "authenticate":
-            pin = args.get("pin", "").strip()
-            expected = self.config.get('auth', {}).get('pin', '')
+            pin = str(args.get("pin", "") or "").strip()
+            expected = str(self.config.get('auth', {}).get('pin', '') or '')
+            require_pin = bool((self.config.get('auth', {}) or {}).get('require_pin', False))
+
+            if require_pin and (not expected or expected.startswith('${')):
+                # Fail CLOSED. The PIN gate was requested but no usable PIN
+                # is configured, so nobody can pass it. Previously this
+                # auto-passed and handed an unauthenticated caller the full
+                # privileged toolset (process_query = shell access).
+                logger.error(
+                    "Authentication attempted but no usable PIN is "
+                    "configured; refusing to authenticate."
+                )
+                return (
+                    "Authentication is unavailable right now. Please try "
+                    "calling back later."
+                )
+
+            if session.pin_attempts >= MAX_PIN_ATTEMPTS:
+                logger.warning(
+                    f"Too many wrong PIN attempts from {session.remote_number}; "
+                    f"authentication disabled for this call"
+                )
+                return (
+                    "Too many incorrect PIN attempts. Please hang up and "
+                    "call back if you still need help."
+                )
+
             if not expected or expected.startswith('${'):
-                # No PIN configured, auto-pass
+                # No PIN gate requested at all -- nothing to verify.
                 session.authenticated = True
             elif pin == expected:
                 session.authenticated = True
             else:
+                session.pin_attempts += 1
+                remaining = max(0, MAX_PIN_ATTEMPTS - session.pin_attempts)
                 logger.warning(f"Bad PIN attempt from {session.remote_number}")
-                return "Wrong PIN. Please try again."
+                if remaining == 0:
+                    return (
+                        "Too many incorrect PIN attempts. Please hang up and "
+                        "call back if you still need help."
+                    )
+                return f"Wrong PIN. Please try again. ({remaining} attempts left)"
 
             if session.authenticated:
                 logger.info(f"Caller {session.remote_number} authenticated on {session.call_id[:16]}")
@@ -698,12 +1160,22 @@ class OpenClawVoice:
                     config = {
                         "type": "session.update",
                         "session": {
-                            "instructions": INBOUND_AUTH_INSTRUCTIONS,
+                            "instructions": self._compose_instructions(
+                                INBOUND_AUTH_INSTRUCTIONS,
+                                caller_number=session.remote_number,
+                                number_label="The caller ID",
+                            ),
                             "tools": TOOLS_AUTHENTICATED,
                         }
                     }
                     await session.bridge.ws.send(json.dumps(config))
                 return "PIN accepted! You now have full access. How can I help you?"
+
+        # hangup_call is never gated: ending a call must always be possible,
+        # even for a caller who has not authenticated. Otherwise an
+        # unauthenticated caller is trapped on the line with no way out.
+        if name == "hangup_call":
+            return await self._handle_hangup(session, args)
 
         # Gate all other tools behind authentication
         if not session.authenticated:
@@ -720,9 +1192,13 @@ class OpenClawVoice:
             task = args.get("task", "Say hello")
             if not number:
                 return "I need a phone number to call."
+            logger.info(f"schedule_outbound_call requested for '{number}' (task: {str(task)[:80]})")
             call_id = await self.make_outbound_call(number, task)
             if call_id:
-                return f"Outbound call started (call_id: {call_id[:16]}). I'll handle the conversation."
+                return (
+                    f"Outbound call started (call_id: {call_id}). "
+ f"The call to {number} is connecting. I'll handle the conversation."
+                )
             return "Failed to start the outbound call. The line may be busy or max calls reached."
 
         elif name == "connect_to_call":
@@ -734,7 +1210,68 @@ class OpenClawVoice:
             target.conference_peer = session
             return "Connected! You can now hear the other call. I'm bridging audio between both parties."
 
+        elif name == "hangup_call":
+            return await self._handle_hangup(session, args)
+
         return f"Unknown tool: {name}"
+
+    async def _handle_hangup(self, session: CallSession, args: dict) -> str:
+        """End the call after the agent has finished speaking.
+
+        The agent says its goodbye first and then calls hangup_call, so we
+        must not cut the line mid-sentence. Wait until the bridge reports it
+        has stopped speaking, give the final RTP frames a moment to flush,
+        then send BYE.
+        """
+        reason = str(args.get("reason", "") or "conversation complete")
+        logger.info(
+            f"hangup_call requested on call {session.call_id[:16]} "
+            f"(reason: {reason})"
+        )
+
+        # Guard against a goodbye loop. The model sometimes calls hangup_call
+        # repeatedly, and each tool result nudges it to say goodbye again.
+        if session.hangup_scheduled:
+            return "Already ending. Say nothing further."
+        session.hangup_scheduled = True
+
+        async def _hangup_when_done():
+            try:
+                deadline = time.monotonic() + 30.0
+                while time.monotonic() < deadline:
+                    bridge = session.bridge
+                    if bridge and bridge.is_speaking:
+                        await asyncio.sleep(0.2)
+                        continue
+                    # The model can emit its message AND the hangup_call tool
+                    # call in the same response. In that case is_speaking is
+                    # already False but the audio is still queued, and
+                    # hanging up immediately cut the message off mid-sentence
+                    # (the party only heard the first few words).
+                    #
+                    # So: wait for the outbound queue to drain as well, then
+                    # give the final RTP frames a moment to flush.
+                    if bridge and bridge.outbound_queue.qsize() > 0:
+                        await asyncio.sleep(0.2)
+                        continue
+                    # Queue is empty and the model is not speaking. Wait a
+                    # beat for the last frames to reach the phone.
+                    await asyncio.sleep(1.5)
+                    if bridge and bridge.outbound_queue.qsize() > 0:
+                        # More audio arrived during the flush wait.
+                        continue
+                    break
+                await self._end_call(session)
+                logger.info(
+                    f"hangup_call completed on call {session.call_id[:16]}"
+                )
+            except Exception as e:
+                logger.warning(f"hangup_call failed: {e}")
+
+        asyncio.create_task(_hangup_when_done())
+        # The wording matters: "say your goodbye first" made the model repeat
+        # the goodbye several times before the call actually dropped.
+        return "Ending the call now. Do not speak again."
 
     # ---- HTTP API --------------------------------------------------------
 
@@ -785,12 +1322,33 @@ class OpenClawVoice:
     async def _api_health(self, request: web.Request) -> web.Response:
         registered = self.sip_client.registered if self.sip_client else False
         active_count = len(self.call_manager.active())
-        return web.json_response({
+        health = {
             'registered': registered,
             'active_calls': active_count,
             'max_concurrent': self.call_manager.max_concurrent,
             'uptime_s': int(time.time() - self._start_time) if hasattr(self, '_start_time') else 0,
-        })
+        }
+
+        # How long ago the extension last registered successfully. The
+        # `registered` flag alone can be stale (it is cleared on failure), so a
+        # consumer needs the age to tell "registered just now" from "has not
+        # managed to register since start".
+        if self.sip_client and getattr(self.sip_client, 'registered_at', None):
+            health['registered_at'] = self.sip_client.registered_at
+            health['registered_age_s'] = int(time.time() - self.sip_client.registered_at)
+
+        # Per-customer identity, so a fleet health check can tell which
+        # instance is which and which extension it answers on.
+        if self.instance:
+            health['instance'] = self.instance
+        sip_cfg = self.config.get('sip', {})
+        if sip_cfg.get('server'):
+            health['sip_server'] = sip_cfg['server']
+        if sip_cfg.get('extension'):
+            health['extension'] = str(sip_cfg['extension'])
+        health['api_port'] = self.api_port
+
+        return web.json_response(health)
 
     async def _api_conference(self, request: web.Request) -> web.Response:
         call_id = request.match_info['call_id']
@@ -826,13 +1384,20 @@ async def main():
     parser.add_argument('--no-api', action='store_true', help='Disable HTTP API')
     args = parser.parse_args()
 
+    # Allow SIP-only registration without an xAI key (for smoke tests / receptionist
+    # wiring before the voice backend is selected). Set SKIP_XAI_VALIDATION=1 in .env.
+    skip_xai = os.getenv('SKIP_XAI_VALIDATION', '').lower() in ('1', 'true', 'yes')
+    if skip_xai:
+        logger.warning("SKIP_XAI_VALIDATION set — SIP registration only, no audio bridge")
+
     config = load_config()
 
     # Validate
     xai_key = config.get('xai', {}).get('api_key', '')
-    if not xai_key or xai_key.startswith('${'):
-        logger.error("XAI_API_KEY not set. export XAI_API_KEY=...")
-        sys.exit(1)
+    if not skip_xai:
+        if not xai_key or xai_key.startswith('${'):
+            logger.error("XAI_API_KEY not set. export XAI_API_KEY=...")
+            sys.exit(1)
     sip_pw = config.get('sip', {}).get('password', '')
     if not sip_pw or sip_pw.startswith('${'):
         logger.error("SIP_PASSWORD not set. export SIP_PASSWORD=...")

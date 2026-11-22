@@ -18,6 +18,12 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+# How long to wait before retrying a failed re-registration. A re-register
+# tears the old contact down before creating the new one, so a failed attempt
+# leaves the extension unregistered on the PBX; retrying soon keeps that
+# outage window short instead of waiting for the next scheduled slot.
+SIP_RE_REGISTER_RETRY_SECONDS = 30
+
 
 class RTPSession:
     """Minimal RTP session for audio streaming"""
@@ -31,6 +37,7 @@ class RTPSession:
         self.sequence = 0
         self.timestamp = 0
         self.ssrc = hash(uuid.uuid4()) & 0xFFFFFFFF
+        self._closed = False
 
     def set_remote(self, addr: str, port: int):
         """Set remote RTP endpoint"""
@@ -88,6 +95,8 @@ class RTPSession:
 
     def receive_audio(self, timeout: float = 0.1) -> Optional[bytes]:
         """Receive RTP packet and extract audio payload"""
+        if self._closed:
+            raise OSError("RTP session closed")
         self.socket.settimeout(timeout)
         try:
             data, addr = self.socket.recvfrom(2048)
@@ -99,12 +108,21 @@ class RTPSession:
         except socket.timeout:
             return None
         except Exception as e:
+            if self._closed:
+                # Socket was closed underneath us (remote hangup). Surface the
+                # teardown so the call loop can end the call instead of
+                # spinning on a dead descriptor.
+                raise OSError("RTP session closed")
             logger.error(f"RTP receive error: {e}")
             return None
 
     def close(self):
         """Close RTP socket"""
-        self.socket.close()
+        self._closed = True
+        try:
+            self.socket.close()
+        except Exception:
+            pass
 
 
 class SIPProtocol(asyncio.DatagramProtocol):
@@ -227,6 +245,9 @@ class SIPClient:
         self.cseq = 1
 
         self.registered = False
+        # Wall-clock time of the last SUCCESSFUL registration, so health can
+        # report how fresh the registration is rather than just a flag.
+        self.registered_at: Optional[float] = None
         self.active_call = None
         self.rtp_session: Optional[RTPSession] = None
         self.negotiated_codec: int = 0  # 0=PCMU, 9=G.722
@@ -238,6 +259,13 @@ class SIPClient:
 
         self.running = False
         self._re_register_task: Optional[asyncio.Task] = None
+        # True while a re-registration loop should keep running. Set when a
+        # registration succeeds, cleared on stop(). This is deliberately
+        # separate from `registered`, which only describes the last attempt.
+        self._re_register_enabled = False
+        # The server-granted re-register cadence, restored after a failed
+        # attempt retries on the short backoff.
+        self._normal_re_register_interval = 900
 
         # Asyncio transport (set by listen_for_calls)
         self._transport = None
@@ -484,7 +512,21 @@ class SIPClient:
 
         Phase 1: Clears all stale contacts first via unregister_all().
         Phase 2: Parses server-granted Expires and schedules re-register at half.
+
+        On any failure path the `registered` flag and its timestamp are
+        cleared. `register()` tears the old contact down (Contact: *,
+        Expires: 0) before creating the new one, so once an attempt fails the
+        extension really is unregistered at the PBX. Leaving the old value in
+        place made /health report "registered" after a failed
+        re-registration — the daemon looked healthy precisely while it was
+        deaf, which is the one thing this flag exists to prevent.
+
+        The flag is only cleared once the attempt has failed, not while it is
+        in flight: during the brief re-register window the previous
+        registration may still be serving callers, and flipping the flag
+        early would cause spurious outage alarms.
         """
+        succeeded = False
         try:
             # Phase 1: Clear stale registrations
             await self.unregister_all()
@@ -515,6 +557,8 @@ class SIPClient:
             if 'SIP/2.0 200 OK' in response_text:
                 logger.info("Server accepted registration without authentication")
                 self.registered = True
+                self.registered_at = time.time()
+                succeeded = True
                 server_expires = self._parse_server_expires(response_text)
                 self._log_contacts(response_text)
                 self._schedule_re_register(server_expires // 2)
@@ -571,7 +615,7 @@ class SIPClient:
 
             auth_header = 'Authorization: Digest ' + ', '.join(auth_parts)
 
-            logger.info(f"Authorization header: {auth_header}")
+            logger.info("Authorization header: Digest <redacted>")
 
             # Send authenticated REGISTER (keep same Call-ID and From tag)
             self.cseq += 1
@@ -593,6 +637,8 @@ class SIPClient:
 
                 if first_line.startswith('SIP/2.0 200'):
                     self.registered = True
+                    self.registered_at = time.time()
+                    succeeded = True
                     server_expires = self._parse_server_expires(response_text)
                     self._log_contacts(response_text)
                     interval = max(server_expires // 2, 15)
@@ -617,6 +663,12 @@ class SIPClient:
             if self.call_id:
                 self._remove_response_queue(self.call_id)
             return False
+        finally:
+            if not succeeded:
+                # The attempt failed, so the extension is not registered at the
+                # PBX. Say so, rather than reporting a stale success.
+                self.registered = False
+                self.registered_at = None
 
     def _log_contacts(self, response_text: str):
         """Log Contact headers from a registration response."""
@@ -691,6 +743,8 @@ class SIPClient:
         """Schedule periodic re-registration. Default 900s (half of typical 1800s expiry)."""
         if self._re_register_task and not self._re_register_task.done():
             self._re_register_task.cancel()
+        self._re_register_enabled = True
+        self._normal_re_register_interval = max(interval, SIP_RE_REGISTER_RETRY_SECONDS)
         try:
             loop = asyncio.get_event_loop()
             self._re_register_task = loop.create_task(self._re_register_loop(interval))
@@ -698,18 +752,36 @@ class SIPClient:
             logger.warning("No event loop available for re-registration scheduling")
 
     async def _re_register_loop(self, interval: int):
-        """Periodically re-register to keep registration alive."""
-        while self.running or self.registered:
+        """Periodically re-register to keep registration alive.
+
+        A failed attempt must NOT end this loop. `register()` clears
+        `self.registered` when an attempt fails, so keying the loop on that
+        flag would make a single failed re-registration permanently abandon the
+        extension — the worst possible outcome, because the PBX has already
+        dropped the contact by then. The loop is therefore keyed on
+        `_re_register_enabled`, and a failed attempt is retried on a short
+        interval to shrink the outage window.
+        """
+        while self.running or self._re_register_enabled:
             await asyncio.sleep(interval)
-            if not self.registered:
+            if not self._re_register_enabled:
                 break
             logger.info(f"Re-registering (interval={interval}s)")
             try:
                 result = await self.register()
                 if not result:
-                    logger.error("Re-registration failed")
+                    logger.error(
+                        "Re-registration failed; retrying in %ss",
+                        SIP_RE_REGISTER_RETRY_SECONDS,
+                    )
+                    interval = SIP_RE_REGISTER_RETRY_SECONDS
+                else:
+                    # register() schedules a fresh loop with the server-granted
+                    # interval on success, so restore the normal cadence here.
+                    interval = self._normal_re_register_interval
             except Exception as e:
                 logger.error(f"Re-registration error: {e}")
+                interval = SIP_RE_REGISTER_RETRY_SECONDS
 
     # ------------------------------------------------------------------
     # Outbound calls
@@ -731,6 +803,13 @@ class SIPClient:
 
             # Generate call parameters
             call_id = self._generate_call_id()
+            # Expose the call_id to the caller BEFORE the call starts. The
+            # handler is only invoked once the call is answered, which can be
+            # many seconds later -- so the caller could not know the call_id
+            # while waiting, and an API caller got "call failed" even though
+            # the call was fine. This lets make_outbound_call return the
+            # call_id immediately.
+            self.last_call_id = call_id
             from_tag = self._generate_tag()
             branch = self._generate_branch()
             invite_cseq = self.cseq
@@ -830,9 +909,12 @@ class SIPClient:
                     # Extract media IP from SDP (c= line)
                     rtp_ip = self._extract_sdp_ip(response_text) or addr[0]
 
-                    # Extract negotiated codec from SDP answer
+                    # In an SDP *answer*, the first payload type in the m= line
+                    # is the one the answerer selected for the session
+                    # (RFC 3264 §6). We must honour that choice, not override
+                    # it with our own preference.
                     negotiated_codec = self._extract_sdp_codec(response_text)
-                    codec_name = "G.722" if negotiated_codec == 9 else "PCMU"
+                    codec_name = {0: "PCMU", 8: "PCMA", 9: "G.722"}.get(negotiated_codec, "PCMU")
                     logger.info(f"Negotiated codec: {codec_name} (payload type {negotiated_codec})")
 
                     # Set remote RTP endpoint
@@ -853,6 +935,15 @@ class SIPClient:
                         'from_uri': from_uri,
                         'to_uri': to_uri,
                         'addr': addr,
+                        # Dialog identity for a correct in-dialog BYE.
+                        'remote_target': to_uri,
+                        'remote_contact': self._extract_header(response_text, 'Contact'),
+                        'remote_from_uri': from_uri,
+                        'remote_to_uri': to_uri,
+                        'bye_from_header': f'"{self.display_name}" <{from_uri}>;tag={from_tag}',
+                        'bye_to_header': to_with_tag,
+                        'invite_cseq': invite_cseq,
+                        'local_cseq': max(invite_cseq + 1, self.cseq),
                     }
                     self._active_calls[call_id] = call_state
 
@@ -1007,16 +1098,19 @@ class SIPClient:
                 self.rtp_session = RTPSession()
             rtp_port = self.rtp_session.local_port
 
-        # Offer PCMU (0) first since xAI uses u-law natively, then G.722 as fallback
+        # Offer PCMU (0) ONLY. The xAI realtime bridge speaks G.711 u-law, and
+        # Asterisk picks its own favourite from whatever we offer — offering
+        # G.722 (9) as well made Asterisk answer "m=audio ... RTP/AVP 9 0",
+        # i.e. G.722, which we cannot encode. The caller then heard noise.
+        # Offering only PCMU forces Asterisk to answer with PCMU.
         sdp_lines = [
             "v=0",
             f"o=- {int(time.time())} 1 IN IP4 {sdp_ip}",
             "s=HFIB Voice Call",
             f"c=IN IP4 {sdp_ip}",
             "t=0 0",
-            f"m=audio {rtp_port} RTP/AVP 0 9",
+            f"m=audio {rtp_port} RTP/AVP 0",
             "a=rtpmap:0 PCMU/8000",
-            "a=rtpmap:9 G722/8000",
             "a=sendrecv",
             "a=ptime:20",
             "",
@@ -1192,12 +1286,72 @@ class SIPClient:
             return int(match.group(1))
         return 0  # Default to PCMU
 
+    def _extract_offered_codecs(self, message: str) -> list:
+        """Extract the full list of payload types the peer offered in its SDP.
+
+        `m=audio <port> RTP/AVP <pt> <pt> ...` — the first entry is the peer's
+        preference. We need the whole list because the answer must only offer
+        codecs the peer actually offered.
+        """
+        match = re.search(r'm=audio \d+ [^\r\n]*?(\d+(?:\s+\d+)*)', message)
+        if not match:
+            return []
+        try:
+            return [int(pt) for pt in match.group(1).split()]
+        except ValueError:
+            return []
+
+    def _pick_codec(self, offered_codecs: list) -> int:
+        """Choose the payload type to answer with.
+
+        The xAI realtime bridge only speaks G.711 u-law (PCMU, payload type 0),
+        so we cannot answer with G.722 (PT 9) even though Asterisk prefers it —
+        doing so produces a half-duplex call where the caller hears silence.
+
+        Prefer PCMU (0) whenever the peer offers it. Otherwise fall back to
+        PCMA (8), and only then to the peer's first preference.
+        """
+        for preferred in (0, 8):
+            if preferred in offered_codecs:
+                return preferred
+        return offered_codecs[0] if offered_codecs else 0
+
     def _extract_tag(self, header_value: str) -> Optional[str]:
         """Extract tag parameter from a SIP header value"""
         match = re.search(r'tag=([^\s;>]+)', header_value)
         if match:
             return match.group(1)
         return None
+
+    def _extract_cseq_number(self, cseq_header: str) -> int:
+        """Extract the numeric part of a CSeq header ('2008 INVITE' -> 2008)."""
+        if not cseq_header:
+            return 0
+        match = re.match(r'\s*(\d+)', cseq_header)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return 0
+        return 0
+
+    def _extract_uri(self, header_value: str) -> str:
+        """Extract the SIP URI from a header value.
+
+        '\"Anonymous\" <sip:anonymous@anonymous.invalid>;tag=abc' ->
+        'sip:anonymous@anonymous.invalid'
+        """
+        if not header_value:
+            return ""
+        match = re.search(r'<([^>]+)>', header_value)
+        if match:
+            return match.group(1).strip()
+        # No angle brackets: take the first whitespace-delimited token.
+        token = header_value.split(';')[0].strip()
+        parts = token.split(None, 1)
+        if len(parts) == 2:
+            return parts[1].strip()
+        return token
 
     def _extract_sdp_ip(self, message: str) -> Optional[str]:
         """Extract media IP from SDP c= line"""
@@ -1365,10 +1519,15 @@ class SIPClient:
             rtp_port = self._extract_sdp_port(invite_message)
             rtp_ip = self._extract_sdp_ip(invite_message) or addr[0]
 
-            # Extract negotiated codec from SDP offer
-            negotiated_codec = self._extract_sdp_codec(invite_message)
-            codec_name = "G.722" if negotiated_codec == 9 else "PCMU"
+            # Extract the codec list the caller offered and pick the one we can
+            # actually use. We only send/receive G.711 u-law with the xAI
+            # bridge, so prefer PCMU over Asterisk's preferred G.722.
+            offered_codecs = self._extract_offered_codecs(invite_message)
+            negotiated_codec = self._pick_codec(offered_codecs)
+            codec_name = {0: "PCMU", 8: "PCMA", 9: "G.722"}.get(negotiated_codec, "PCMU")
             logger.info(f"Incoming call codec: {codec_name} (payload type {negotiated_codec})")
+            if offered_codecs:
+                logger.info(f"Caller offered codecs: {offered_codecs}; answering with {codec_name}")
 
             # Create RTP session (per-call, not instance-level)
             rtp_session = RTPSession()
@@ -1405,7 +1564,7 @@ class SIPClient:
             self._send(ringing_response.encode(), addr)
 
             # Send 200 OK with per-call RTP session
-            ok_response = self._build_200_ok(call_id, from_header, to_with_tag, via_header, cseq_header, rtp_session=rtp_session)
+            ok_response = self._build_200_ok(call_id, from_header, to_with_tag, via_header, cseq_header, rtp_session=rtp_session, payload_type=negotiated_codec)
             self._send(ok_response.encode(), addr)
 
             logger.info(f"Call answered, RTP session established")
@@ -1446,8 +1605,35 @@ class SIPClient:
                 if not ack_received:
                     logger.warning("No ACK received within 5s, proceeding anyway")
 
-            # Store per-call state
+            # Store per-call state.
+            #
+            # The dialog identity MUST be captured verbatim from the INVITE.
+            # The old code rebuilt From/To from scratch and pointed the BYE
+            # Request-URI at our own address, so Asterisk answered every
+            # inbound BYE with '481 Call/Transaction Does Not Exist' and the
+            # call stayed up on the PBX while the daemon believed it had
+            # ended (symptom: caller hears silence, call never disconnects).
+            #
+            # For an inbound call the BYE must target the REMOTE party:
+            #   - Request-URI: the contact URI the caller advertised
+            #   - From:        our identity, tagged with OUR to-tag
+            #   - To:          the caller's identity, tagged with THEIR tag
+            #   - CSeq:        higher than the INVITE's, in the same dialog
             from_tag = self._extract_tag(from_header)
+            remote_uri = self._extract_uri(from_header)
+            remote_contact = self._extract_header(invite_message, 'Contact')
+            remote_target = self._extract_uri(remote_contact) or remote_uri
+            invite_cseq = self._extract_cseq_number(cseq_header)
+
+            # For a request WE send inside an inbound dialog, the roles are
+            # swapped relative to the INVITE (RFC 3261 8.1.1.3):
+            #   our BYE From = our URI + the tag we used in the 200 OK
+            #   our BYE To   = the caller's URI + the caller's tag
+            # so the 200 OK's To header becomes the BYE's From, and the
+            # INVITE's From becomes the BYE's To.
+            bye_from_header = to_with_tag
+            bye_to_header = from_header
+
             call_state = {
                 'call_id': call_id,
                 'direction': 'inbound',
@@ -1459,6 +1645,15 @@ class SIPClient:
                 'from_uri': f"sip:{self.extension}@{self.server}",
                 'to_uri': f"sip:{self.extension}@{self.server}",
                 'addr': addr,
+                # Dialog identity for a correct in-dialog BYE.
+                'remote_target': remote_target,
+                'remote_contact': remote_contact,
+                'remote_from_uri': remote_uri,
+                'remote_to_uri': self._extract_uri(to_header),
+                'bye_from_header': bye_from_header,
+                'bye_to_header': bye_to_header,
+                'invite_cseq': invite_cseq,
+                'local_cseq': max(invite_cseq + 1, self.cseq),
             }
             self._active_calls[call_id] = call_state
 
@@ -1478,7 +1673,7 @@ class SIPClient:
                 if cs.get('rtp_session'):
                     cs['rtp_session'].close()
 
-    def _build_200_ok(self, call_id: str, from_header: str, to_header: str, via_header: str, cseq_header: str, rtp_session: Optional[RTPSession] = None) -> str:
+    def _build_200_ok(self, call_id: str, from_header: str, to_header: str, via_header: str, cseq_header: str, rtp_session: Optional[RTPSession] = None, payload_type: int = 0) -> str:
         """Build 200 OK response for INVITE"""
         # Use external IP for RTP so Asterisk can reach us
         sdp_ip = self.external_ip or self.local_ip
@@ -1495,15 +1690,22 @@ class SIPClient:
             self.rtp_session = rtp
 
         ts = int(datetime.now().timestamp())
+
+        # Echo the codec we actually negotiated. Answering with a fixed
+        # "0 8" (PCMU/PCMA) regardless of what the caller offered caused a
+        # codec mismatch: Asterisk prefers G.722 (PT 9) for inbound calls, so it
+        # sent G.722 audio while we sent PCMU, and the caller heard silence.
+        codec_rtp = {0: "PCMU/8000", 8: "PCMA/8000", 9: "G722/8000"}.get(payload_type, "PCMU/8000")
         sdp_lines = [
             "v=0",
             f"o=- {ts} {ts} IN IP4 {sdp_ip}",
             "s=HFIB Voice Agent",
             f"c=IN IP4 {sdp_ip}",
             "t=0 0",
-            f"m=audio {rtp.local_port} RTP/AVP 0 8",
-            "a=rtpmap:0 PCMU/8000",
-            "a=rtpmap:8 PCMA/8000",
+            f"m=audio {rtp.local_port} RTP/AVP {payload_type}",
+            f"a=rtpmap:{payload_type} {codec_rtp}",
+            "a=sendrecv",
+            "a=ptime:20",
             "",
         ]
         sdp = "\r\n".join(sdp_lines)
@@ -1529,12 +1731,30 @@ class SIPClient:
     # ------------------------------------------------------------------
 
     async def hangup(self, call_id: Optional[str] = None, target_extension: Optional[str] = None):
-        """Send BYE to hangup a specific call (or the legacy active_call)."""
+        """Send BYE to hangup a specific call (or the legacy active_call).
+
+        The BYE must be a valid in-dialog request, and the daemon must wait
+        for the response before declaring the call over. Both were broken:
+
+        1. The Request-URI pointed at OUR OWN address, so Asterisk replied
+           '481 Call/Transaction Does Not Exist' and the call stayed up on
+           the PBX while the daemon logged success.
+        2. From/To were rebuilt from scratch instead of reusing the dialog
+           identity captured from the INVITE/200 OK.
+        3. CSeq was taken from the global REGISTER counter, not the call's
+           dialog sequence.
+        4. The response was never read, so a rejected BYE was invisible.
+
+        Now: build the request from the stored dialog identity, wait for the
+        response, and report the outcome. RTP is closed after the BYE is
+        acknowledged (or after a short grace period) so the far end does not
+        hear premature silence.
+        """
         # Resolve call state: prefer per-call dict, fall back to legacy
         cid = call_id or self.active_call
         if not cid:
             logger.warning("hangup: no active call")
-            return
+            return False
 
         call_state = self._active_calls.get(cid)
 
@@ -1544,45 +1764,138 @@ class SIPClient:
             from_tag = call_state.get('from_tag', self.from_tag)
             to_tag = call_state.get('to_tag', self.to_tag)
             rtp = call_state.get('rtp_session')
+            # Dialog identity captured at INVITE/200-OK time.
+            remote_target = call_state.get('remote_target') or to_uri
+            bye_from_header = call_state.get('bye_from_header')
+            bye_to_header = call_state.get('bye_to_header')
+            local_cseq = int(call_state.get('local_cseq') or self.cseq)
         else:
             to_uri = getattr(self, '_call_to_uri', None) or f"sip:{target_extension or self.extension}@{self.server}"
             from_uri = getattr(self, '_call_from_uri', None) or f"sip:{self.extension}@{self.server}"
             from_tag = self.from_tag
             to_tag = self.to_tag
             rtp = self.rtp_session
+            remote_target = to_uri
+            bye_from_header = None
+            bye_to_header = None
+            local_cseq = self.cseq
 
         if not rtp:
             logger.warning(f"hangup: no RTP session for {cid[:16]}")
-            return
+            # Still try to send the BYE: without RTP there is nothing to close
+            # but the SIP dialog may still be alive.
+            rtp = None
 
         contact_uri = f"sip:{self.extension}@{self.external_ip or self.local_ip}:{self.contact_port}"
 
-        # Build To header with tag (required for in-dialog requests per RFC 3261)
-        to_header = f"<{to_uri}>"
-        if to_tag:
-            to_header = f"{to_header};tag={to_tag}"
+        # --- Where to send the BYE ---------------------------------------
+        #
+        # The BYE must go to the peer that sent us the INVITE, not to the
+        # server we are registered with. Those are the same address for a
+        # PBX-originated call (which is why this went unnoticed), but for
+        # any other peer -- a softphone, another SBC, a loopback test
+        # agent -- the BYE was being sent to the wrong place and the peer
+        # never saw it. We captured the source address of the INVITE, so
+        # use it, and fall back to the server only when it is unknown.
+        bye_dest = None
+        if call_state:
+            bye_dest = call_state.get('addr')
+        if not bye_dest:
+            bye_dest = (self.server, self.port)
+
+        # --- Build the in-dialog BYE -------------------------------------
+        #
+        # Request-URI: the REMOTE party. For an inbound call this is the
+        # Contact the caller advertised; for an outbound call it is the URI
+        # we invited.
+        request_uri = remote_target or to_uri
+
+        # From: our identity + our tag. To: their identity + their tag.
+        # Prefer the verbatim headers captured from the dialog so the tags
+        # and display names match exactly what the peer has on file.
+        if bye_from_header and bye_to_header:
+            from_header_out = bye_from_header
+            to_header_out = bye_to_header
+        else:
+            from_header_out = f'"{self.display_name}" <{from_uri}>;tag={from_tag}'
+            to_header_out = f"<{to_uri}>"
+            if to_tag:
+                to_header_out = f"{to_header_out};tag={to_tag}"
+
+        # In-dialog CSeq must be higher than the INVITE's.
+        bye_cseq = max(local_cseq, self.cseq)
 
         bye_request = (
-            f"BYE {to_uri} SIP/2.0\r\n"
+            f"BYE {request_uri} SIP/2.0\r\n"
             f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={self._generate_branch()}\r\n"
-            f'From: "{self.display_name}" <{from_uri}>;tag={from_tag}\r\n'
-            f"To: {to_header}\r\n"
+            f"From: {from_header_out}\r\n"
+            f"To: {to_header_out}\r\n"
             f"Call-ID: {cid}\r\n"
-            f"CSeq: {self.cseq} BYE\r\n"
+            f"CSeq: {bye_cseq} BYE\r\n"
             f"Contact: <{contact_uri}>\r\n"
             f"Max-Forwards: 70\r\n"
             f"Content-Length: 0\r\n"
             f"\r\n"
         )
 
+        # Wait for the response on this Call-ID's queue.
+        self._create_response_queue(cid)
+
         try:
-            self._send(bye_request.encode(), (self.server, self.port))
-            logger.info(f"Sent BYE for {cid[:16]}")
-            self.cseq += 1
+            self._send(bye_request.encode(), bye_dest)
+            logger.info(
+                f"Sent BYE for {cid[:16]} (target={request_uri}, "
+                f"dest={bye_dest[0]}:{bye_dest[1]}, cseq={bye_cseq})"
+            )
+            self.cseq = max(self.cseq, bye_cseq) + 1
         except Exception as e:
             logger.error(f"Error sending BYE: {e}")
+            self._remove_response_queue(cid)
+            if rtp:
+                rtp.close()
+            return False
 
-        rtp.close()
+        # --- Wait for the peer's answer ---------------------------------
+        #
+        # Reading the response is what turns "we sent a BYE" into "the call
+        # really ended". A 481/500 means the peer does not know this
+        # dialog, so the BYE was malformed -- report it instead of silently
+        # pretending the call was torn down.
+        response_text = None
+        bye_acked = False
+        try:
+            response_text, _ = await self._recv_filtered(cid, timeout=5.0)
+        except Exception as e:
+            logger.warning(f"Error waiting for BYE response: {e}")
+
+        status = ''
+        if response_text:
+            status = response_text.split('\r\n')[0].split('\n')[0]
+            logger.info(f"BYE response for {cid[:16]}: {status}")
+            if re.search(r'\b200\b', status):
+                bye_acked = True
+                logger.info(f"BYE acknowledged by peer for {cid[:16]}")
+            else:
+                logger.warning(
+                    f"BYE REJECTED for {cid[:16]}: {status} "
+                    f"(peer did not accept the teardown)"
+                )
+        else:
+            logger.warning(
+                f"No BYE response for {cid[:16]} within 5s "
+                f"(peer may be unreachable; forcing RTP close)"
+            )
+
+        self._remove_response_queue(cid)
+
+        # Close RTP only AFTER the BYE has been answered (or the grace period
+        # expired). Closing it first is what produced the 'sudden silence
+        # but the call stays up' symptom.
+        if rtp:
+            try:
+                rtp.close()
+            except Exception as e:
+                logger.warning(f"Error closing RTP for {cid[:16]}: {e}")
 
         # Clean up per-call state
         self._active_calls.pop(cid, None)
@@ -1593,11 +1906,17 @@ class SIPClient:
             self.active_call = None
             self.to_tag = None
         logger.info(f"Call {cid[:16]} ended")
+        # Report the real outcome: only an acknowledged BYE counts as a
+        # successful teardown. A 481/5xx or a timeout must not be reported as
+        # success, or the caller is left in a call that is still up.
+        return bye_acked
 
     async def stop(self):
         """Stop SIP client and hang up all active calls."""
         self.running = False
         self.registered = False
+        self.registered_at = None
+        self._re_register_enabled = False
         if self._keepalive_task and not self._keepalive_task.done():
             self._keepalive_task.cancel()
         if self._re_register_task and not self._re_register_task.done():

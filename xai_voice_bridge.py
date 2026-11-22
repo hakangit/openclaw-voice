@@ -33,6 +33,32 @@ import websockets
 
 logger = logging.getLogger(__name__)
 
+_SECRET_LOG_KEYS = {"pin", "password", "secret", "token", "api_key", "apikey", "key"}
+
+
+def _redact_tool_args(args: Any) -> Any:
+    """Mask credential-bearing tool arguments before logging.
+
+    The `authenticate` tool carries the caller's PIN in its `pin` argument.
+    Logging the raw xAI function-call arguments wrote the PIN to the journal
+    on every successful authentication, bypassing the redaction that
+    `openclaw_voice._redact_tool_args` applies to its own log line.
+    """
+    if isinstance(args, dict):
+        return {
+            key: ("***" if str(key).strip().lower() in _SECRET_LOG_KEYS else value)
+            for key, value in args.items()
+        }
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+        except (ValueError, TypeError):
+            return args
+        if isinstance(parsed, dict):
+            return json.dumps(_redact_tool_args(parsed))
+    return args
+
+
 # Audio constants - xAI uses same format as SIP!
 RTP_FRAME_BYTES = 160  # 160 bytes u-law = 20ms @ 8kHz
 RTP_FRAME_MS = 20
@@ -133,6 +159,14 @@ class XAIVoiceBridge:
 
     async def _configure_session(self):
         """Send session configuration to xAI."""
+        # Log the composed instructions so the effective prompt is
+        # observable in the journal. Phone prompts are the only way to
+        # verify that persona/callback/tool-gating text actually reached
+        # the model, and they are invisible once the call is over.
+        logger.info(
+            f"xAI session instructions ({len(self.instructions)} chars): "
+            f"{self.instructions[:4000]}"
+        )
         config = {
             "type": "session.update",
             "session": {
@@ -280,7 +314,7 @@ class XAIVoiceBridge:
             name = msg.get("name", "")
             arguments = msg.get("arguments", "{}")
 
-            logger.info(f"Tool call: {name}({arguments})")
+            logger.info(f"Tool call: {name}({_redact_tool_args(arguments)})")
 
             if self.on_tool_call:
                 try:
@@ -290,6 +324,13 @@ class XAIVoiceBridge:
                 except Exception as e:
                     logger.error(f"Tool call error: {e}")
                     await self._send_tool_result(call_id, {"error": str(e)})
+            else:
+                # No handler registered (e.g. an outbound call, where the
+                # model has no tools). Tell xAI so it doesn't wait forever.
+                logger.warning(f"Tool call '{name}' received but no handler is registered")
+                await self._send_tool_result(
+                    call_id, {"error": f"No handler for tool '{name}'"}
+                )
 
         elif msg_type == "error":
             error_msg = msg.get("error", {}).get("message", "Unknown error")

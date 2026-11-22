@@ -113,7 +113,7 @@ Inbound calls can require a DTMF PIN before connecting to the voice agent. Confi
 ```yaml
 auth:
   pin: ${OPENCLAW_AUTH_PIN}
-  whitelist: ["+15551234567"]  # numbers that skip PIN
+  whitelist: ["+1555XXXX567"]  # numbers that skip PIN
 ```
 
 ## Design
